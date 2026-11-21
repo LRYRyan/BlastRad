@@ -1,0 +1,21 @@
+# Records maps/ in the environment the commits were labeled in. Used by `make maps`,
+# never by the scorer (the submission's own Dockerfile downloads nothing).
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.lock /work/requirements.lock
+RUN pip install --no-cache-dir -r /work/requirements.lock
+
+RUN git init -q /src \
+ && git -C /src remote add origin https://github.com/tobymao/sqlglot \
+ && git -C /src fetch -q --depth 1 origin eb11aec4be8cb2122afe713a4816662c3f0fb2fa \
+ && git -C /src checkout -q FETCH_HEAD
+
+COPY fingerprint.py /work/fingerprint.py
+COPY tools /work/tools
+COPY sample/tests.json /work/tests.json
+WORKDIR /work
+CMD ["sh", "tools/make_maps.sh"]
