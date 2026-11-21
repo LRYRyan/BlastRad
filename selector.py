@@ -47,6 +47,11 @@ RUN, IMP, DEF = 1, 2, 4
 PACKAGE = "sqlglot/"          # the tree fingerprint.py can import
 DYNAMIC_GAIN_MS = int(os.environ.get("BR_DYNAMIC_GAIN_MS", "2000"))  # import the patch only if it can save this much
 REPLAY_SHARE = 0.5            # rerun parts of a slow test only if that costs at most this share of what it can save
+DIAGNOSTIC_KEEPS_BASELINE = True  # diagnostic build: select exactly as the build that scored 179.287 s
+SLOW_TESTS = (
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_parser.py::TestParser::test_max_nodes",
+)
 DYNAMIC_TIMEOUT = 8          # seconds for one import of the patched package (it normally takes half a second)
 DYNAMIC_BUDGET = 60          # seconds for all such imports and replays in a batch
 BATCH_BUDGET = 110           # after this many seconds every remaining commit simply runs everything
@@ -1614,7 +1619,7 @@ def select(maps, text, tree, cost, replay=None):
                     bodies[old] = outcome.new_text
                     explained = True
             else:
-                part, why = data_file(maps, old, change)
+                part, why = maps.readers(old), "data file"  # diagnostic: as in the scored build
         base = os.path.basename(new or old)
         if base in PYTEST_FILES and (new or old).count("/") <= 1:
             if base in ("pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml") or "pytest" in added_text(change):
@@ -1645,7 +1650,9 @@ def select(maps, text, tree, cost, replay=None):
             else:
                 broken = any(entry[2] == "!import" for entry in changed)
                 mask |= narrowed if broken else narrowed & importers
-                if not broken and not moved and replay is not None and notes["words"]:
+                if DIAGNOSTIC_KEEPS_BASELINE:
+                    pass
+                elif not broken and not moved and replay is not None and notes["words"]:
                     # Tests chosen only because they executed a line naming a changed attribute:
                     # for the replayed ones, those lines stand in for the change.
                     strong |= notes["strong"]
@@ -1745,6 +1752,143 @@ def split(tests):
     return best
 
 
+# --------------------------------------------------------------------------- diagnostic
+
+
+def diagnostic(groups, millis, slow, max_nodes, code_only):
+    """DIAGNOSTIC BUILD, NOT AN ENTRY. Rewrites one commit's answer so that a practice run
+    tells where the seconds go, without changing what the answer costs except by markers:
+
+    - the two slowest tests are taken out of the answer and other tests of exactly the same
+      total duration put in their place, so the commit costs the same but counts as missed
+      if one of the two really fails; such a commit costs 1 ms more (marker a);
+    - a commit whose normal answer holds test_max_nodes costs 41 ms more (marker b);
+    - a cheap answer (under 3 s) to a patch of package code only gets one more worker, 2 s
+      (marker c).
+
+    Returns the new groups, or the old ones when a rewrite cannot be made exact."""
+    def price(parts):
+        parts = [part for part in parts if part]
+        return (max(sum(millis[n] for n in part) for part in parts) + WORKER_MS * len(parts)) if parts else 0
+
+    before = price(groups)
+    chosen = {number for group in groups for number in group}
+    spare = sorted(((ms, number) for number, ms in millis.items() if number not in chosen and number not in slow), reverse=True)
+
+    def take(target):
+        """Unused tests whose durations add up to exactly `target` ms, or None."""
+        picked = []
+        left = target
+        for index, (ms, number) in enumerate(spare):
+            if 0 < ms <= left:
+                picked.append(index)
+                left -= ms
+                if not left:
+                    break
+        if left:
+            return None
+        numbers = [spare[index][1] for index in picked]
+        for index in reversed(picked):
+            del spare[index]
+        return numbers
+
+    def shift(parts, target):
+        """Moves tests worth exactly `target` ms from other workers onto the busiest one."""
+        loads = [sum(millis[n] for n in part) for part in parts]
+        top = loads.index(max(loads))
+        left = target
+        moves = []
+        for index, part in enumerate(parts):
+            if index == top:
+                continue
+            room = len(part) - 1  # never empty a worker
+            for number in sorted(part, key=lambda n: -millis[n]):
+                if room and 0 < millis[number] <= left:
+                    moves.append((index, number))
+                    left -= millis[number]
+                    room -= 1
+                if not left:
+                    break
+            if not left:
+                break
+        if left:
+            return False
+        for index, number in moves:
+            parts[index].remove(number)
+            parts[top].append(number)
+        return True
+
+    def raise_top(parts, amount):
+        """Makes the busiest worker exactly `amount` ms busier, with unused tests or with
+        tests taken from the other workers (never emptying one)."""
+        if amount <= 0:
+            return amount == 0
+        loads = [sum(millis[n] for n in part) for part in parts]
+        top = loads.index(max(loads))
+        extra = take(amount)
+        if extra is not None:
+            parts[top].extend(extra)
+            return True
+        if shift(parts, amount):
+            return True
+        # Some of each: unused tests first, the rest from the other workers.
+        left = amount
+        used = []
+        for index, (ms, number) in enumerate(spare):
+            if 0 < ms <= left:
+                used.append(index)
+                left -= ms
+        if left and not shift(parts, left):
+            return False
+        parts[top].extend(spare[index][1] for index in used)
+        for index in reversed(used):
+            del spare[index]
+        return True
+
+    parts = [list(group) for group in groups]
+    expected = before
+    present = [number for number in slow if number in chosen]
+    if present:
+        top_load = max(sum(millis[n] for n in part) for part in parts)
+        probed = [[number for number in part if number not in slow] for part in parts]
+        exact = True
+        for part in probed:
+            if part:
+                continue
+            # A worker that held nothing else keeps its place with one small test.
+            fill = take(1)
+            if fill is None:
+                donors = [other for other in probed if len(other) > 1]
+                if donors:
+                    donor = max(donors, key=len)
+                    number = min(donor, key=lambda n: millis[n])
+                    donor.remove(number)
+                    fill = [number]
+            if fill is None:
+                exact = False
+                break
+            part.extend(fill)
+        if exact:
+            now = max(sum(millis[n] for n in part) for part in probed)
+            exact = now <= top_load and raise_top(probed, top_load - now) and raise_top(probed, 1)
+        if exact:
+            parts = probed
+            expected += 1
+        if max_nodes in chosen and raise_top(parts, 41):
+            expected += 41
+    elif parts and before < 3000 and code_only and len(parts) < MAX_WORKERS:
+        top = max(sum(millis[n] for n in part) for part in parts)
+        fits_in = [(ms, number) for ms, number in spare if ms <= top]
+        if fits_in:
+            parts.append([fits_in[-1][1]])
+            expected += WORKER_MS
+    parts = [part for part in parts if part]
+    flat = [number for part in parts for number in part]
+    if price(parts) != expected or len(flat) != len(set(flat)) or len(parts) > MAX_WORKERS:
+        return groups
+    return parts
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -1806,6 +1950,8 @@ def main():
     def cost(mask):
         return split([(millis[number], number) for number in numbers_of(mask)])[0]
 
+    slow_numbers = {test["id"]: test["number"] for test in tests if test["id"] in SLOW_TESTS}
+    slow = set(slow_numbers.values())
     tree = Tree(maps)
     replay = Replay(maps, tree)
     out = []
@@ -1833,6 +1979,15 @@ def main():
                 numbers = list(millis)
             total, groups = split([(millis[number], number) for number in numbers])
             log("  -> %d tests, %d workers, %.3fs" % (len(numbers), len(groups), total / 1000))
+            try:
+                paths = [path for change in parse_patch(text) for path in (change.old, change.new) if path]
+                code_only = bool(paths) and all(path.startswith(PACKAGE) and path.endswith(".py") for path in paths)
+            except Exception:
+                code_only = False
+            rewritten = diagnostic(groups, millis, slow, slow_numbers.get(SLOW_TESTS[1]), code_only)
+            if rewritten is not groups:
+                log("  diagnostic: %d tests, %d workers" % (sum(len(g) for g in rewritten), len(rewritten)))
+            groups = rewritten
             out.append(json.dumps({"commit": commit, "workers": groups}, separators=(",", ":")))
     finally:
         tree.close()

@@ -1,3 +1,7 @@
+> **DIAGNOSTIC BUILD, NOT AN ENTRY.** This commit deliberately leaves the two slowest tests out of its answers
+> (see `diagnostic` in `selector.py`) to measure, on the practice board, how often they are really needed.
+> It is not our submission for the final.
+
 # Blast Radius entry
 
 For every patch against sqlglot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, print the tests
