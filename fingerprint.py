@@ -66,6 +66,7 @@ class Walker:
     With loose=True the order of items in every container is ignored.
     """
 
+
     def __init__(self, loose=False):
         self.loose = loose
         self.memo = {}
@@ -319,7 +320,7 @@ def names_of(root):
                 continue
             done.add(id(cls))
             qualname = cls.__qualname__
-            yield name, qualname, "__bases__", (cls.__mro__[1:], type(cls).__name__), None
+            yield name, qualname, "__bases__", (cls.__mro__[1:], type(cls).__name__, cls), None
             for attr, value in list(vars(cls).items()):
                 if attr in SKIP_CLASS_ATTRS:
                     continue
@@ -334,9 +335,17 @@ def names_of(root):
 
 
 def full(root, write):
+    import typing
+
     exact, loose = Walker(False), Walker(True)
     out = ["#python\t%s" % sys.version.split()[0]]
     for module, qualname, name, value, owner in names_of(root):
+        if name == "__bases__":
+            cls = value[2]
+            value = value[:2]
+            if typing.is_typeddict(cls):
+                # Calling a TypedDict class gives a plain dict: it never has instances.
+                out.append("%s\t%s\t!typeddict\tx\t1\t1" % (module, qualname))
         if name == "!import":
             out.append("%s\t\t!import\tx\t%s\t%s" % (module, value, value))
             continue
@@ -384,6 +393,8 @@ def against(root, baseline_path, write):
         if name == "!import":
             out.append("%s\t\t!import\tx\t-" % module)
             continue
+        if name == "__bases__":
+            value = value[:2]
         kind = "c" if name == "__bases__" else kind_of(value)
         old = baseline.get(key)
         if old is None:
@@ -404,7 +415,7 @@ def against(root, baseline_path, write):
                 differing = ",".join(sorted(ref for ref in set(before) | set(after) if before.get(ref) != after.get(ref))) or "-"
         out.append("%s\t%s\t%s\t%s\t%s" % (module, qualname, name, kind if kind == old_kind else "o", differing))
     for key, old in baseline.items():
-        if key not in seen:
+        if key not in seen and key[2] != "!typeddict":
             out.append("%s\t%s\t%s\t%s\t-" % (key[0], key[1], key[2], old[0]))
     write("\n".join(out) + "\n")
     return 0
@@ -432,8 +443,9 @@ def main():
     write = sys.stdout.write
     flush = sys.stdout.flush
     sys.stdout = sys.stderr = open(os.devnull, "w")  # modules may print while importing
-    if len(sys.argv) > 3 and sys.argv[2] == "--against":
-        code = against(root, sys.argv[3], write)
+    arguments = sys.argv[2:]
+    if len(arguments) > 1 and arguments[0] == "--against":
+        code = against(root, arguments[1], write)
     else:
         code = 0
         full(root, write)

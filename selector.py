@@ -75,6 +75,7 @@ class Maps:
         self.src = meta["src"]
         self.classes = meta["classes"]
         self.holders = meta.get("holders", {})
+        self.typeddicts = set(meta.get("typeddicts", ()))
         self.python = meta.get("python")
         self.paths = set(meta["paths"])
         self.unmapped = 0
@@ -88,6 +89,7 @@ class Maps:
         self._bit_cache = {0: 0}
         self._text_cache = {}
         self._line_cache = {}
+        self._text_lines = {}
         self._word_cache = {}
         self._top = None
         self._compare = None
@@ -176,14 +178,85 @@ class Maps:
 
     # ---- who reads a name
 
-    def mentions(self, words):
+    def words(self, path):
+        """line -> identifiers that occur on it in code or in string literals: names, attribute
+        names, imported names, keyword names. Comments do not count, and neither do type
+        annotations in a module with `from __future__ import annotations` (never evaluated)."""
+        found = self._line_cache.get(path)
+        if found is not None:
+            return found
+        found = {}
+        text = self.text(path)
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, RecursionError):
+            # Fall back to every word of every line.
+            for number, content in enumerate(text.split("\n"), 1):
+                found[number] = set(IDENTIFIER.findall(content))
+            self._line_cache[path] = found
+            return found
+        lazy = any(
+            isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names)
+            for node in tree.body[:6]
+        )
+
+        def add(line, word):
+            if word:
+                found.setdefault(line, set()).add(word)
+
+        todo = [tree]
+        while todo:
+            node = todo.pop()
+            for field, value in ast.iter_fields(node):
+                if lazy and field in ("annotation", "returns"):
+                    continue
+                if isinstance(value, ast.AST):
+                    todo.append(value)
+                elif isinstance(value, list):
+                    todo.extend(item for item in value if isinstance(item, ast.AST))
+            if isinstance(node, ast.Name):
+                add(node.lineno, node.id)
+            elif isinstance(node, ast.Attribute):
+                add(node.end_lineno, node.attr)
+            elif isinstance(node, ast.Constant):
+                if isinstance(node.value, str):
+                    for word in IDENTIFIER.findall(node.value):
+                        for line in range(node.lineno, node.end_lineno + 1):
+                            add(line, word)
+            elif isinstance(node, ast.alias):
+                for word in (node.name or "").split(".") + [node.asname]:
+                    add(node.lineno, word)
+            elif isinstance(node, ast.keyword):
+                add(node.value.lineno, node.arg)
+            elif isinstance(node, ast.arg):
+                add(node.lineno, node.arg)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                add(node.lineno, node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                for word in node.names:
+                    add(node.lineno, word)
+            elif isinstance(node, ast.MatchClass):
+                for word in node.kwd_attrs:
+                    add(node.lineno, word)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+                add(node.lineno, node.name)
+            elif isinstance(node, ast.MatchMapping):
+                add(node.lineno, node.rest)
+            elif isinstance(node, ast.ExceptHandler):
+                add(node.lineno, node.name)
+        self._line_cache[path] = found
+        return found
+
+    def mentions(self, words, strict=False):
         """Tests that executed, at call time, a line containing every one of the given identifiers.
 
         Inside the package only call-time execution counts (import-time flows are
         what the fingerprint comparison follows). Outside it, e.g. in test
-        modules, any execution counts.
+        modules, any execution counts. A line contains an identifier when its text
+        does; with strict, when its code does (see words).
         """
-        key = tuple(words)
+        key = tuple(words) + (strict,)
         found = self._word_cache.get(key)
         if found is not None:
             return found
@@ -199,9 +272,10 @@ class Maps:
             rows = self.rows(path)
             if rows is None:
                 continue
-            source = self._line_cache.get(path)
+            source = self._text_lines.get(path)
             if source is None:
-                source = self._line_cache[path] = text.split("\n")
+                source = self._text_lines[path] = text.split("\n")
+            on_line = None
             lines, run_ids, imp_ids, def_ids = rows
             inside = path.startswith(PACKAGE)
             limit = len(source)
@@ -213,6 +287,12 @@ class Maps:
                     continue
                 if not all(pattern.search(content) for pattern in patterns):
                     continue
+                if strict:
+                    if on_line is None:
+                        on_line = self.words(path)
+                    present = on_line.get(number, ())
+                    if any(word not in present for word in words):
+                        continue
                 idents.add(run_ids[position])
                 if not inside:
                     idents.add(imp_ids[position])
@@ -432,6 +512,7 @@ BLOCKS = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast
 if hasattr(ast, "TryStar"):
     BLOCKS = BLOCKS + (ast.TryStar,)
 BODY_FIELDS = ("body", "orelse", "finalbody", "handlers")
+IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 
 
@@ -1226,6 +1307,8 @@ class Replay:
             verdict = self.tree.replay(files, {test: entry[0] for test, entry in chosen.items()}, REPLAY_SHARE * gain)
             dropped = 0
             for test in chosen:
+                if verdict.get(test) is not True:
+                    log("      %s: %s" % ("changed" if test in verdict else "not finished", test))
                 if verdict.get(test) is True:
                     dropped |= data["bit"][test]
                     log("      unchanged: %s" % test)
@@ -1307,7 +1390,11 @@ def reached(maps, changed):
             users = maps.users(path, qualname)
             simple = qualname.rsplit(".", 1)[-1]
             special = name.startswith("__") and name.endswith("__") and name != "__annotations__"
-            if special or kind in ("f", "c"):
+            if users is None and "%s.%s" % (module, qualname) in maps.typeddicts:
+                # Calling a TypedDict class gives a plain dict, so only code that names the class
+                # can read anything from it. (A TypedDict built on it has names of its own here.)
+                part = maps.mentions((simple,), strict=True) & importers
+            elif special or kind in ("f", "c"):
                 # Methods can be found by computed names (e.g. "<key>_sql"), and special
                 # attributes are read by the interpreter itself: every user counts.
                 part = users if users is not None else importers

@@ -234,7 +234,7 @@ def main():
     }
     with open(os.path.join(out, "meta.json"), "w") as handle:
         json.dump(meta, handle, separators=(",", ":"))
-    meta["holders"] = fingerprint(repo, out)
+    meta["holders"], meta["typeddicts"] = fingerprint(repo, out)
     compare_dir = os.environ.get("BR_COMPARE_DIR")
     if compare_dir:
         compare_profile(compare_dir, index, out)
@@ -391,6 +391,7 @@ def fingerprint(repo, out, runs=16):
     lines = ["#python\t" + version]
     modes = {"o": 0, "b": 0, "v": 0}
     holders = {}  # class -> classes that keep it as an attribute (e.g. a dialect and its parser)
+    typeddicts = []
     for key in tables[0]:
         rows = [table.get(key) for table in tables]
         if any(row is None for row in rows):
@@ -405,6 +406,8 @@ def fingerprint(repo, out, runs=16):
         first = rows[0] if rows[0] is not None else ["o", "", ""]
         which = 1 if mode == "b" else 0
         row = list(key) + [first[0], mode, "" if mode == "v" else first[1 + which]]
+        if key[2] == "!typeddict":
+            typeddicts.append(key[0] + "." + key[1])
         if len(first) > 3 and first[3][:1] == "@":
             row.append(first[3])
             if key[1]:
@@ -417,7 +420,7 @@ def fingerprint(repo, out, runs=16):
     with open(os.path.join(out, "fingerprint.bin"), "wb") as handle:
         handle.write(zlib.compress("\n".join(lines).encode(), 9))
     print("fingerprint: %d names (%d exact, %d order-free, %d unstable and ignored)" % (len(lines) - 1, modes["o"], modes["b"], modes["v"]))
-    return {name: sorted(found) for name, found in sorted(holders.items())}
+    return {name: sorted(found) for name, found in sorted(holders.items())}, sorted(typeddicts)
 
 
 if __name__ == "__main__":

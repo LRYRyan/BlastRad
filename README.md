@@ -39,8 +39,10 @@ see what the change really reaches.
    The comparison names exactly the class attributes and module names that came out different,
    including tables derived from the changed one, subclasses that copy it, and values computed
    by metaclasses. The selection then shrinks to tests that instantiated those classes and
-   executed, at call time, a line that mentions those names. If the patched package no longer
-   imports, every test that used the broken module is selected.
+   executed, at call time, a line that mentions those names. A `TypedDict` class is never
+   instantiated (calling it gives a plain dict), so a change to one reaches only the tests
+   that executed code naming the class. If the patched package no longer imports, every test
+   that used the broken module is selected.
 5. **Three slow tests are checked instead of assumed.** `test_execute_tpcds` (21.5 s recorded),
    `test_execute_tpch` and `test_optimized_tpch` spend their time in duckdb, pandas and a
    process pool; what they ask of sqlglot is to parse, pickle, transpile and execute a fixed
@@ -50,7 +52,8 @@ see what the change really reaches.
    nothing differs the test cannot fail and is dropped. Steps that never executed a changed
    line are not rerun: they run the same code on the same input. This is only tried when the
    rerun is expected to cost at most half of what dropping the test saves, it stops at the
-   first difference, and a test it cannot finish within that budget stays selected.
+   first difference, and a test it cannot finish within that budget stays selected (the
+   remaining cost is projected from how the steps rerun so far went).
 6. **Other files** (SQL fixtures, CSV data, JSON) select the tests that opened them. New or
    removed files also select the tests that listed their directory. New pytest configuration, a
    new `conftest.py`, or a new importable top-level name selects everything.
@@ -66,7 +69,10 @@ module, then everything) and never narrows.
 Recorded by running every test of the pinned commit once, each test in its own forked process
 so that lazily imported dialects and class-level setup are attributed to every test that needs
 them (`tools/br_tracer.py`). Helper processes that tests start (the optimizer and executor
-tests use process pools) are recorded too.
+tests use process pools) are recorded too. Lines come from `sys.monitoring` line events, plus
+function-start events: Python reports no line event for a function or lambda written on a
+single line (`exp.IntDiv: lambda self, e: self.binary(e, "DIV")`), and the dialect tables
+are full of those.
 
 - For every source line: the tests that executed it at call time, the tests that executed it
   inside a function while sqlglot was being imported, and the tests that executed it in a
@@ -107,7 +113,7 @@ possible answer (exactly the failing tests) costs 94.4; running everything costs
 `tools/mutation_check.py` mutates the pinned tree at random, asks the selector, then really
 runs the tests it left out among those that ever touched the mutated file, and reports any
 that fail. Mode `cmp` makes only same-family comparison swaps, to test the comparison
-profile. It needs a scratch copy of the sqlglot checkout and the packages of
+profile; mode `lam` mutates only lambdas in the dialect tables. It needs a scratch copy of the sqlglot checkout and the packages of
 `requirements.lock`.
 
 `tools/replay_check.py` does the same for the replay: for random mutants that select a

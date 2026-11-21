@@ -253,9 +253,9 @@ def check(root, plan, budget):
 
     how (ds.C units only): 0 run it all; 1 stop after optimizing when the optimized query is
     the pinned one; 2 nothing to run when the pickled query is the pinned one.
-    A test is left out of the answer when finishing it would take more than `budget` CPU
-    seconds in total; when an early stop does not happen, the same is assumed for the units
-    still to come."""
+    A test is left out of the answer when finishing it is expected to take more than `budget`
+    CPU seconds in total; how often early stops fail so far sets the expectation for the
+    units still to come."""
     with open(os.environ.get("BR_SIGS") or os.path.join(root, "replay-sigs.json")) as handle:
         pinned = json.load(handle)
     if pinned["python"] != sys.version.split()[0] or pinned["seed"] != os.environ.get("PYTHONHASHSEED"):
@@ -264,14 +264,16 @@ def check(root, plan, budget):
     units = Units(root)
     verdict = {}
     started = time.process_time()
-    hopeful = True  # early stops have worked so far
+    tried = full = 0  # units with a possible early stop, and how many had to run in full
     for test, wanted in plan.items():
         passed = True
         for position, (unit, how) in enumerate(wanted):
+            share = (full + 0.5) / (tried + 6.0) if tried else 0.0  # expected share of full runs ahead
             ahead = 0.0
             for later, later_how in wanted[position:]:
                 entry = pinned[later]
-                ahead += entry["opt_seconds"] if later_how == 1 and hopeful else 0.01 if later_how == 2 and hopeful else entry["seconds"]
+                quick = entry.get("opt_seconds", entry["seconds"]) if later_how == 1 else 0.01 if later_how == 2 else entry["seconds"]
+                ahead += quick + share * (entry["seconds"] - quick)
             if time.process_time() - started + ahead > budget:
                 passed = None
                 break
@@ -283,12 +285,14 @@ def check(root, plan, budget):
                     index = int(unit.rsplit(".", 1)[1])
                     blob = units.blob(index)
                     same_input = digest(blob) == pinned["ds.A.%d" % index]["sig"]
+                    if how >= 1:
+                        tried += 1
                     if how == 2 and same_input:
                         continue
                     allow = how >= 1 and same_input
                     _opt, signature = units.run_c(blob, allow, pinned[unit]["sig"][0])
                     if how >= 1 and signature != SAME:
-                        hopeful = False
+                        full += 1
                     good = signature == SAME or signature == pinned[unit]["sig"][1]
                 elif ".A." in unit:
                     units.run(unit)

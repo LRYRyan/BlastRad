@@ -222,6 +222,39 @@ def _audit(event, args):
                 _emit("L", real[len(ROOT):], 0)
 
 
+_starts = {}
+
+
+def _on_start(code, offset):
+    """A function begins. Python reports no line event for code that sits on the line it
+    starts on (`lambda e: e.this`, `def f(self): return 1`), so the start itself is recorded:
+    the first line of the code object and the line of the instruction it starts at."""
+    name = rel(code.co_filename)
+    if name is None or not code.co_flags & 1:
+        return DISABLE
+    lines = _starts.get(code)
+    if lines is None:
+        lines = {code.co_firstlineno}
+        for first, last, number in code.co_lines():
+            if number is not None and first <= offset < last:
+                lines.add(number)
+                break
+        lines = _starts[code] = tuple(lines)
+    if _depth[0]:
+        for line in lines:
+            if _sink[0] is None:
+                IMP.add((name, line))
+            else:
+                _emit("I", name, line)
+        return None
+    for line in lines:
+        if _sink[0] is None:
+            RUN.add((name, line))
+        else:
+            _emit("R", name, line)
+    return DISABLE
+
+
 _installed = [False]
 
 
@@ -237,7 +270,8 @@ def install(root):
     sys.addaudithook(_audit)
     mon.use_tool_id(TOOL, "blast-radius")
     mon.register_callback(TOOL, mon.events.LINE, _on_line)
-    mon.set_events(TOOL, mon.events.LINE)
+    mon.register_callback(TOOL, mon.events.PY_START, _on_start)
+    mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
 
 
 def reset():

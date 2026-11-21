@@ -1,8 +1,9 @@
 """Soundness check: mutate the pinned tree at random, ask the selector, then really run the
 tests it left out (among those that ever touched the mutated file) and report any that fail.
 
-usage: python3 tools/mutation_check.py <scratch copy of the sqlglot checkout> <count> <seed> <def|body|both|cmp>
+usage: python3 tools/mutation_check.py <scratch copy of the sqlglot checkout> <count> <seed> <def|body|both|cmp|lam>
 
+lam mutates only lambdas of module- and class-level statements (the dialect tables).
 cmp makes only same-family comparison swaps (is/==, is not/!=, </<=, >/>=) inside functions
 and keeps the mutants the comparison profile let the selector drop tests for.
 
@@ -39,6 +40,9 @@ def cost(mask):
 SWAPS = [(" == ", " != "), (" != ", " == "), (" and ", " or "), (" or ", " and "), ("True", "False"), ("False", "True"),
          (" is not ", " is "), (" < ", " <= "), (" > ", " >= "), (" <= ", " < "), (" >= ", " > "), (" + ", " - "), ("not ", "")]
 
+TABLE_LAMBDAS = set()  # (path, line) inside a lambda of a module- or class-level statement
+
+
 def candidates(path, text):
     """(line number, is import-time) for single lines worth mutating."""
     tree_ = ast.parse(text)
@@ -64,6 +68,8 @@ def candidates(path, text):
                 for line in range(node.lineno, node.end_lineno + 1):
                     inside_lambda = any(a <= line <= b for a, b in lambdas)
                     out.append((line, (not in_function) and not inside_lambda))
+                    if inside_lambda and not in_function:
+                        TABLE_LAMBDAS.add((path, line))
     visit(tree_.body, False)
     return out
 
@@ -107,7 +113,8 @@ while made < COUNT and attempts < COUNT * 60:
         continue
     number, at_import = rng.choice(cands)
     if MODE == "def" and not at_import: continue
-    if MODE in ("body", "cmp") and at_import: continue
+    if MODE in ("body", "cmp", "lam") and at_import: continue
+    if MODE == "lam" and (path, number) not in TABLE_LAMBDAS: continue
     if lines[number - 1].lstrip().startswith("#"): continue
     new_line = mutate_line(lines[number - 1], rng)
     if new_line is None or new_line == lines[number - 1]:
