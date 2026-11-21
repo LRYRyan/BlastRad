@@ -1,9 +1,10 @@
 """Soundness check: mutate the pinned tree at random, ask the selector, then really run the
 tests it left out (among those that ever touched the mutated file) and report any that fail.
 
-usage: python3 tools/mutation_check.py <scratch copy of the sqlglot checkout> <count> <seed> <def|body|both|cmp|lam>
+usage: python3 tools/mutation_check.py <scratch copy of the sqlglot checkout> <count> <seed> <def|body|both|cmp|lam|imp|imp2>
 
 lam mutates only lambdas of module- and class-level statements (the dialect tables).
+imp mutates only function lines that also execute while sqlglot is being imported; imp2 keeps\nthose of them where most of the tests that ran the line during import were left out.
 cmp makes only same-family comparison swaps (is/==, is not/!=, </<=, >/>=) inside functions
 and keeps the mutants the comparison profile let the selector drop tests for.
 
@@ -99,11 +100,13 @@ def mutate_line(line, rng):
 rng = random.Random(SEED)
 files = sorted(p for p in maps.src if p.startswith("sqlglot/") and p.endswith(".py"))
 weights = [len(maps.text(p)) for p in files]
+if MODE == "imp2":  # every file with functions that run during import, equally likely
+    weights = [1 if any(maps.rows(p)[2]) else 0 for p in files]
 made = 0; problems = 0; attempts = 0
 def say(*a):
     print(*a, flush=True)
 
-while made < COUNT and attempts < COUNT * 60:
+while made < COUNT and attempts < COUNT * (3000 if MODE == "imp2" else 60):
     attempts += 1
     path = rng.choices(files, weights)[0]
     text = maps.text(path)
@@ -113,8 +116,9 @@ while made < COUNT and attempts < COUNT * 60:
         continue
     number, at_import = rng.choice(cands)
     if MODE == "def" and not at_import: continue
-    if MODE in ("body", "cmp", "lam") and at_import: continue
+    if MODE in ("body", "cmp", "lam", "imp", "imp2") and at_import: continue
     if MODE == "lam" and (path, number) not in TABLE_LAMBDAS: continue
+    if MODE in ("imp", "imp2") and not maps.hits(path, number, number, sel.IMP): continue
     if lines[number - 1].lstrip().startswith("#"): continue
     new_line = mutate_line(lines[number - 1], rng)
     if new_line is None or new_line == lines[number - 1]:
@@ -130,6 +134,8 @@ while made < COUNT and attempts < COUNT * 60:
     diff = "".join(difflib.unified_diff(text.splitlines(True), new_text.splitlines(True), "a/" + path, "b/" + path))
     patch = "diff --git a/%s b/%s\n%s" % (path, path, diff)
     mask, active = sel.select(maps, patch, tree, cost)
+    if MODE == "imp2" and 2 * bin(mask).count("1") > bin(maps.hits(path, number, number, sel.IMP)).count("1"):
+        continue  # only mutants where most tests that ran the line during import were left out
     touched_all = maps.whole(path)
     if MODE == "cmp" and mask:
         continue  # the profile made no difference here

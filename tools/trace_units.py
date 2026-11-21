@@ -11,6 +11,7 @@ a query; ds.C units get their pickled query from the ds.A child of the same quer
 import os
 import pickle
 import sys
+import unittest  # noqa: F401  as in the tests: sqlglot.expressions.core.UNITTEST
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)

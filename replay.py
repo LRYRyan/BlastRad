@@ -40,6 +40,7 @@ import os
 import pickle
 import sys
 import time
+import unittest  # noqa: F401  sqlglot checks more when a test runner is loaded (expressions.core.UNITTEST), as it is in the tests
 
 TESTS = {
     "ds": "tests/test_executor.py::TestExecutor::test_execute_tpcds",

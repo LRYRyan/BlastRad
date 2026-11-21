@@ -5,6 +5,7 @@ usage: PYTHONHASHSEED=0 python3 tools/replay_truth.py <checkout>     (prints JSO
 Written separately from replay.py and with no shortcuts: every query is parsed, pickled,
 transpiled and executed. tools/replay_check.py compares replay.py's verdicts with it."""
 import sys, os, pickle, hashlib, json, csv, ast, gzip, time
+import unittest  # as in the tests: sqlglot.expressions.core.UNITTEST
 root = sys.argv[1]; sys.path.insert(0, root)
 sys.stdout_real = sys.stdout
 from tests.helpers import TPCH_SCHEMA, TPCDS_SCHEMA, load_sql_fixture_pairs, FIXTURES_DIR

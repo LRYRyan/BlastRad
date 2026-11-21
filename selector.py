@@ -47,11 +47,6 @@ RUN, IMP, DEF = 1, 2, 4
 PACKAGE = "sqlglot/"          # the tree fingerprint.py can import
 DYNAMIC_GAIN_MS = int(os.environ.get("BR_DYNAMIC_GAIN_MS", "2000"))  # import the patch only if it can save this much
 REPLAY_SHARE = 0.5            # rerun parts of a slow test only if that costs at most this share of what it can save
-DIAGNOSTIC_KEEPS_BASELINE = True  # diagnostic build: select exactly as the build that scored 179.287 s
-SLOW_TESTS = (
-    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
-    "tests/test_parser.py::TestParser::test_max_nodes",
-)
 DYNAMIC_TIMEOUT = 8          # seconds for one import of the patched package (it normally takes half a second)
 DYNAMIC_BUDGET = 60          # seconds for all such imports and replays in a batch
 BATCH_BUDGET = 110           # after this many seconds every remaining commit simply runs everything
@@ -710,6 +705,9 @@ class PyDiff:
         self.at_import = False
         self.ranges = []   # line ranges whose call-time execution selected tests
         self.strong = 0    # tests selected for any other reason than executing those ranges at call time
+        self.imp = 0       # tests that executed edited function lines while sqlglot was being imported
+        self.neutral = []  # (old first, old last, new first, new last) of edited top-level functions
+        self.outer = None  # (old, new) top-level function being compared
         self.checks = []  # new-side nodes worth compiling for late syntax errors
         self.future_annotations = any(
             isinstance(node, ast.ImportFrom) and node.module == "__future__"
@@ -738,6 +736,20 @@ class PyDiff:
         A range that is a whole function takes kinds=RUN | IMP: its `def` line and decorators
         also execute in the enclosing class or module body at import, which is not a call."""
         self.ranges.append((first, last))
+        during_import = self.maps.hits(self.path, first, last, kinds & IMP)
+        if during_import and self.outer is not None:
+            # The function also runs while sqlglot is imported. What that leaves behind is
+            # compared separately (fingerprint.py, with this function's own code set aside);
+            # here only the tests that ran the lines at call time are taken.
+            old, new = self.outer
+            span = (first_line(old), old.end_lineno, first_line(new), new.end_lineno)
+            if span not in self.neutral:
+                self.neutral.append(span)
+            self.imp |= during_import
+            self.strong |= self.maps.hits(self.path, first, last, kinds & DEF)
+            self.note(what, first, last, self.maps.hits(self.path, first, last, kinds & ~IMP))
+            log("    %-22s %d tests ran these lines during import" % ("", bin(during_import).count("1")))
+            return
         self.strong |= self.maps.hits(self.path, first, last, kinds & (IMP | DEF))
         self.note(what, first, last, self.maps.hits(self.path, first, last, kinds))
 
@@ -850,7 +862,14 @@ class PyDiff:
         if type(old) is type(new) and isinstance(old, FUNCTIONS + (ast.ClassDef,) + BLOCKS):
             if header_dump(old) == header_dump(new):
                 if isinstance(old, FUNCTIONS):
-                    self.diff_list(old.body, new.body, old, klass, old, new_function or new)
+                    entered = function is None and self.outer is None
+                    if entered:
+                        self.outer = (old, new)
+                    try:
+                        self.diff_list(old.body, new.body, old, klass, old, new_function or new)
+                    finally:
+                        if entered:
+                            self.outer = None
                 elif isinstance(old, ast.ClassDef):
                     # A class defined inside a function runs its body at call time: keep the function.
                     self.diff_list(old.body, new.body, function, old, old, new_function)
@@ -865,7 +884,14 @@ class PyDiff:
                     a, b = getattr(old, field, None), getattr(new, field, None)
                     if isinstance(a, list) and isinstance(b, list) and (a or b):
                         if isinstance(old, FUNCTIONS):
-                            self.diff_list(a, b, old, klass, old, new_function or new)
+                            entered = function is None and self.outer is None
+                            if entered:
+                                self.outer = (old, new)
+                            try:
+                                self.diff_list(a, b, old, klass, old, new_function or new)
+                            finally:
+                                if entered:
+                                    self.outer = None
                         elif isinstance(old, ast.ClassDef):
                             self.diff_list(a, b, function, old, old, new_function)
                         else:
@@ -985,9 +1011,10 @@ OLD_TREES = {}
 class Outcome:
     """What one changed file selects. importers is None when nothing changed at import time."""
 
-    __slots__ = ("mask", "importers", "why", "new_text", "ranges", "strong")
+    __slots__ = ("mask", "importers", "why", "new_text", "ranges", "strong", "neutral")
 
-    def __init__(self, mask, why, importers=None, new_text=None, ranges=None, strong=None):
+    def __init__(self, mask, why, importers=None, new_text=None, ranges=None, strong=None, neutral=()):
+        self.neutral = neutral      # edited top-level functions, as line spans in the old and new file
         self.mask = mask
         self.why = why
         self.importers = importers
@@ -1033,8 +1060,8 @@ def python_file(maps, path, change):
         if not compiles(new_function, nodes):
             return Outcome(maps.whole(path), "does not compile")
     mask = diff.body | maps.readers(path)
-    if diff.at_import:
-        return Outcome(mask, "changed at import time", diff.importers, new_text)
+    if diff.at_import or diff.imp:
+        return Outcome(mask, "changed at import time", diff.importers | diff.imp, new_text, neutral=diff.neutral)
     return Outcome(mask, "changed", new_text=new_text, ranges=diff.ranges, strong=diff.strong | maps.readers(path))
 
 
@@ -1158,6 +1185,53 @@ class Tree:
             parts = line.split("\t")
             if len(parts) == 5 and parts[0][:1] != "#":
                 changed.append((parts[0], parts[1], parts[2], parts[3], None if parts[4] == "-" else parts[4].split(",")))
+        return changed
+
+    def compare_edited(self, files, neutral):
+        """Like compare, for patches that also edit the body of functions that run during
+        import: the pinned and the patched tree are both fingerprinted with those functions'
+        code set aside, so that only what importing leaves behind is compared. neutral:
+        (path, old first, old last, new first, new last)."""
+        if self.spent > DYNAMIC_BUDGET:
+            return None
+        self.prepare()
+        before = ",".join("%s:%d-%d" % (path, a, b) for path, a, b, _c, _d in neutral)
+        after = ",".join("%s:%d-%d" % (path, c, d) for path, _a, _b, c, d in neutral)
+        code, pinned = self.run("--neutral", before, "--emit", self.baseline)
+        if code != 0 or not pinned:
+            return None
+        saved = {}
+        try:
+            self.patch(files, saved)
+            code, patched = self.run("--neutral", after, "--emit", self.baseline)
+        finally:
+            self.restore(saved)
+        if code != 0 or not patched:
+            return None
+
+        def table(output):
+            found = {}
+            for line in output.split("\n"):
+                parts = line.split("\t")
+                if len(parts) == 6:
+                    found[(parts[0], parts[1], parts[2])] = parts[3:]
+            return found
+
+        old, new = table(pinned), table(patched)
+        changed = []
+        for key in set(old) | set(new):
+            a, b = old.get(key), new.get(key)
+            if a is not None and b is not None and a[1] == b[1]:
+                continue
+            if key[2] == "!import" and b is None:
+                continue
+            entries = None
+            if a is not None and b is not None and a[2] != "-" and b[2] != "-":
+                left = dict(entry.split("=") for entry in a[2].split(","))
+                right = dict(entry.split("=") for entry in b[2].split(","))
+                entries = sorted(ref for ref in set(left) | set(right) if left.get(ref) != right.get(ref)) or None
+            kind = (b or a)[0] if a is None or b is None or a[0] == b[0] else "o"
+            changed.append(key + (kind, entries))
         return changed
 
     def restore(self, saved):
@@ -1572,6 +1646,7 @@ def select(maps, text, tree, cost, replay=None):
     bodies = {}       # package path -> patched text, for files changed only inside functions
     at_import = {}    # path -> (importers, new text) for package files changed at import time
     moved = {}        # package files the patch adds (text) or removes (None)
+    neutral = []      # (path, old first, old last, new first, new last) of functions edited inside
     for change in parse_patch(text):
         old, new = change.old, change.new
         if change.added and not change.renamed:
@@ -1611,6 +1686,8 @@ def select(maps, text, tree, cost, replay=None):
                 if outcome.importers is not None:
                     if old.startswith(PACKAGE) and not old.endswith("/__main__.py"):
                         at_import[old] = (outcome.importers, outcome.new_text)
+                        for span in outcome.neutral:
+                            neutral.append((old,) + span)
                     else:
                         part |= outcome.importers
                 elif outcome.ranges is not None and old.startswith(PACKAGE):
@@ -1619,7 +1696,7 @@ def select(maps, text, tree, cost, replay=None):
                     bodies[old] = outcome.new_text
                     explained = True
             else:
-                part, why = maps.readers(old), "data file"  # diagnostic: as in the scored build
+                part, why = data_file(maps, old, change)
         base = os.path.basename(new or old)
         if base in PYTEST_FILES and (new or old).count("/") <= 1:
             if base in ("pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml") or "pytest" in added_text(change):
@@ -1637,10 +1714,10 @@ def select(maps, text, tree, cost, replay=None):
             importers |= part
         if importers & ~mask:
             narrowed = None
-            if cost(mask | importers) - cost(mask) >= DYNAMIC_GAIN_MS:
+            if cost(mask | importers) - cost(mask) >= DYNAMIC_GAIN_MS * (1.75 if neutral else 1):
                 files = dict(moved)
                 files.update({path: new_text for path, (_m, new_text) in at_import.items()})
-                changed = tree.compare(files)
+                changed = tree.compare_edited(files, neutral) if neutral else tree.compare(files)
                 if changed is not None:
                     log("    import-time state: %d names differ" % len(changed))
                     notes = {}
@@ -1650,9 +1727,7 @@ def select(maps, text, tree, cost, replay=None):
             else:
                 broken = any(entry[2] == "!import" for entry in changed)
                 mask |= narrowed if broken else narrowed & importers
-                if DIAGNOSTIC_KEEPS_BASELINE:
-                    pass
-                elif not broken and not moved and replay is not None and notes["words"]:
+                if not broken and not moved and replay is not None and notes["words"]:
                     # Tests chosen only because they executed a line naming a changed attribute:
                     # for the replayed ones, those lines stand in for the change.
                     strong |= notes["strong"]
@@ -1752,143 +1827,6 @@ def split(tests):
     return best
 
 
-# --------------------------------------------------------------------------- diagnostic
-
-
-def diagnostic(groups, millis, slow, max_nodes, code_only):
-    """DIAGNOSTIC BUILD, NOT AN ENTRY. Rewrites one commit's answer so that a practice run
-    tells where the seconds go, without changing what the answer costs except by markers:
-
-    - the two slowest tests are taken out of the answer and other tests of exactly the same
-      total duration put in their place, so the commit costs the same but counts as missed
-      if one of the two really fails; such a commit costs 1 ms more (marker a);
-    - a commit whose normal answer holds test_max_nodes costs 41 ms more (marker b);
-    - a cheap answer (under 3 s) to a patch of package code only gets one more worker, 2 s
-      (marker c).
-
-    Returns the new groups, or the old ones when a rewrite cannot be made exact."""
-    def price(parts):
-        parts = [part for part in parts if part]
-        return (max(sum(millis[n] for n in part) for part in parts) + WORKER_MS * len(parts)) if parts else 0
-
-    before = price(groups)
-    chosen = {number for group in groups for number in group}
-    spare = sorted(((ms, number) for number, ms in millis.items() if number not in chosen and number not in slow), reverse=True)
-
-    def take(target):
-        """Unused tests whose durations add up to exactly `target` ms, or None."""
-        picked = []
-        left = target
-        for index, (ms, number) in enumerate(spare):
-            if 0 < ms <= left:
-                picked.append(index)
-                left -= ms
-                if not left:
-                    break
-        if left:
-            return None
-        numbers = [spare[index][1] for index in picked]
-        for index in reversed(picked):
-            del spare[index]
-        return numbers
-
-    def shift(parts, target):
-        """Moves tests worth exactly `target` ms from other workers onto the busiest one."""
-        loads = [sum(millis[n] for n in part) for part in parts]
-        top = loads.index(max(loads))
-        left = target
-        moves = []
-        for index, part in enumerate(parts):
-            if index == top:
-                continue
-            room = len(part) - 1  # never empty a worker
-            for number in sorted(part, key=lambda n: -millis[n]):
-                if room and 0 < millis[number] <= left:
-                    moves.append((index, number))
-                    left -= millis[number]
-                    room -= 1
-                if not left:
-                    break
-            if not left:
-                break
-        if left:
-            return False
-        for index, number in moves:
-            parts[index].remove(number)
-            parts[top].append(number)
-        return True
-
-    def raise_top(parts, amount):
-        """Makes the busiest worker exactly `amount` ms busier, with unused tests or with
-        tests taken from the other workers (never emptying one)."""
-        if amount <= 0:
-            return amount == 0
-        loads = [sum(millis[n] for n in part) for part in parts]
-        top = loads.index(max(loads))
-        extra = take(amount)
-        if extra is not None:
-            parts[top].extend(extra)
-            return True
-        if shift(parts, amount):
-            return True
-        # Some of each: unused tests first, the rest from the other workers.
-        left = amount
-        used = []
-        for index, (ms, number) in enumerate(spare):
-            if 0 < ms <= left:
-                used.append(index)
-                left -= ms
-        if left and not shift(parts, left):
-            return False
-        parts[top].extend(spare[index][1] for index in used)
-        for index in reversed(used):
-            del spare[index]
-        return True
-
-    parts = [list(group) for group in groups]
-    expected = before
-    present = [number for number in slow if number in chosen]
-    if present:
-        top_load = max(sum(millis[n] for n in part) for part in parts)
-        probed = [[number for number in part if number not in slow] for part in parts]
-        exact = True
-        for part in probed:
-            if part:
-                continue
-            # A worker that held nothing else keeps its place with one small test.
-            fill = take(1)
-            if fill is None:
-                donors = [other for other in probed if len(other) > 1]
-                if donors:
-                    donor = max(donors, key=len)
-                    number = min(donor, key=lambda n: millis[n])
-                    donor.remove(number)
-                    fill = [number]
-            if fill is None:
-                exact = False
-                break
-            part.extend(fill)
-        if exact:
-            now = max(sum(millis[n] for n in part) for part in probed)
-            exact = now <= top_load and raise_top(probed, top_load - now) and raise_top(probed, 1)
-        if exact:
-            parts = probed
-            expected += 1
-        if max_nodes in chosen and raise_top(parts, 41):
-            expected += 41
-    elif parts and before < 3000 and code_only and len(parts) < MAX_WORKERS:
-        top = max(sum(millis[n] for n in part) for part in parts)
-        fits_in = [(ms, number) for ms, number in spare if ms <= top]
-        if fits_in:
-            parts.append([fits_in[-1][1]])
-            expected += WORKER_MS
-    parts = [part for part in parts if part]
-    flat = [number for part in parts for number in part]
-    if price(parts) != expected or len(flat) != len(set(flat)) or len(parts) > MAX_WORKERS:
-        return groups
-    return parts
-
-
 # --------------------------------------------------------------------------- main
 
 
@@ -1950,8 +1888,6 @@ def main():
     def cost(mask):
         return split([(millis[number], number) for number in numbers_of(mask)])[0]
 
-    slow_numbers = {test["id"]: test["number"] for test in tests if test["id"] in SLOW_TESTS}
-    slow = set(slow_numbers.values())
     tree = Tree(maps)
     replay = Replay(maps, tree)
     out = []
@@ -1979,15 +1915,6 @@ def main():
                 numbers = list(millis)
             total, groups = split([(millis[number], number) for number in numbers])
             log("  -> %d tests, %d workers, %.3fs" % (len(numbers), len(groups), total / 1000))
-            try:
-                paths = [path for change in parse_patch(text) for path in (change.old, change.new) if path]
-                code_only = bool(paths) and all(path.startswith(PACKAGE) and path.endswith(".py") for path in paths)
-            except Exception:
-                code_only = False
-            rewritten = diagnostic(groups, millis, slow, slow_numbers.get(SLOW_TESTS[1]), code_only)
-            if rewritten is not groups:
-                log("  diagnostic: %d tests, %d workers" % (sum(len(g) for g in rewritten), len(rewritten)))
-            groups = rewritten
             out.append(json.dumps({"commit": commit, "workers": groups}, separators=(",", ":")))
     finally:
         tree.close()

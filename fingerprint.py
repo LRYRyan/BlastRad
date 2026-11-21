@@ -2,6 +2,8 @@
 
     python -I -S fingerprint.py <tree>                       print the full fingerprint
     python -I -S fingerprint.py <tree> --against <baseline>  print only what differs from a baseline
+    python -I -S fingerprint.py <tree> --emit <baseline>     print every name with its stable digest
+    ... --neutral path:first-last[,...]                      count code defined on those lines as unchanged
 
 <tree> is a directory containing the sqlglot package. Every sqlglot module in
 it is imported and each module-level name and each class attribute is reduced
@@ -37,6 +39,7 @@ import os
 import re
 import sys
 import types
+import unittest  # noqa: F401  sqlglot checks more when a test runner is loaded (expressions.core.UNITTEST), as it is for every test
 import zlib
 
 SKIP_CLASS_ATTRS = {
@@ -212,11 +215,22 @@ class Walker:
             items.sort()
         return head + "|" + "|".join(items)
 
+    neutral = ()  # (path suffix, first line, last line): code defined there counts as unchanged
+
     def code(self, code, depth):
         ident = id(code)
         found = self.memo.get(ident)
         if found is not None:
             return found
+        for suffix, first, last in self.neutral:
+            if first <= code.co_firstlineno <= last and code.co_filename.replace(os.sep, "/").endswith(suffix):
+                # A function whose body the patch edits (or one defined inside it): what it does
+                # when called is judged from line coverage; here only what it left behind at
+                # import is compared.
+                text = "code:edited:%s:%s" % (suffix, code.co_qualname)
+                self.memo[ident] = text
+                self.keep.append(code)
+                return text
         consts = []
         for const in code.co_consts:
             consts.append(self.code(const, depth) if isinstance(const, types.CodeType) else self.canon(const, depth))
@@ -421,6 +435,35 @@ def against(root, baseline_path, write):
     return 0
 
 
+def emit(root, baseline_path, write):
+    """One line per name with the digest the baseline says is stable for it:
+    module, class qualname, name, kind, digest, entry digests (or "-"). The caller compares
+    the output for two trees (used with --neutral, where no stored baseline applies)."""
+    _version, baseline = load_baseline(baseline_path)
+    exact, loose = Walker(False), Walker(True)
+    out = []
+    for module, qualname, name, value, owner in names_of(root):
+        if name == "!import":
+            out.append("%s\t\t!import\tx\t%s\t-" % (module, value))
+            continue
+        if name == "__bases__":
+            value = value[:2]
+        kind = "c" if name == "__bases__" else kind_of(value)
+        old = baseline.get((module, qualname, name))
+        mode = old[1] if old else "o"
+        if mode == "v":
+            continue
+        walker = loose if mode == "b" else exact
+        entries = "-"
+        if old is None or (old[3] and old[3][0] != "@"):
+            items = class_keyed(exact, value)
+            if items:
+                entries = ",".join(sorted("%s=%s" % (ref, digest(walker.canon(item))) for ref, item in items))
+        out.append("%s\t%s\t%s\t%s\t%s\t%s" % (module, qualname, name, kind, value_digest(walker, value, owner), entries))
+    write("\n".join(out) + "\n")
+    return 0
+
+
 def perturb(seed):
     """Shifts later memory addresses around, to expose values that depend on them."""
     import random
@@ -444,8 +487,19 @@ def main():
     flush = sys.stdout.flush
     sys.stdout = sys.stderr = open(os.devnull, "w")  # modules may print while importing
     arguments = sys.argv[2:]
+    if "--neutral" in arguments:
+        position = arguments.index("--neutral")
+        spans = []
+        for item in arguments[position + 1].split(","):
+            suffix, lines = item.rsplit(":", 1)
+            first, last = lines.split("-")
+            spans.append((suffix, int(first), int(last)))
+        Walker.neutral = tuple(spans)
+        del arguments[position:position + 2]
     if len(arguments) > 1 and arguments[0] == "--against":
         code = against(root, arguments[1], write)
+    elif len(arguments) > 1 and arguments[0] == "--emit":
+        code = emit(root, arguments[1], write)
     else:
         code = 0
         full(root, write)

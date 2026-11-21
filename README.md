@@ -1,7 +1,3 @@
-> **DIAGNOSTIC BUILD, NOT AN ENTRY.** This commit deliberately leaves the two slowest tests out of its answers
-> (see `diagnostic` in `selector.py`) to measure, on the practice board, how often they are really needed.
-> It is not our submission for the final.
-
 # Blast Radius entry
 
 For every patch against sqlglot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, print the tests
@@ -161,3 +157,6 @@ then includes it in every commit that changes anything.
 - The replay stands for a test only as far as the test's own code is modelled in `replay.py`
   (it was written from `tests/test_executor.py` at the pinned commit), and it assumes caches
   inside sqlglot are plain memoisation.
+- sqlglot checks more when a test runner is loaded (`expressions.core.UNITTEST`: unexpected
+  arguments raise). The helper processes (`fingerprint.py`, `replay.py`) therefore import
+  `unittest` before sqlglot, so they see what the tests see.
