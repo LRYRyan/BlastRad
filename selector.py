@@ -47,6 +47,8 @@ RUN, IMP, DEF = 1, 2, 4
 PACKAGE = "sqlglot/"          # the tree fingerprint.py can import
 DYNAMIC_GAIN_MS = int(os.environ.get("BR_DYNAMIC_GAIN_MS", "2000"))  # import the patch only if it can save this much
 REPLAY_SHARE = 0.5            # rerun parts of a slow test only if that costs at most this share of what it can save
+REPLAY_FULL_SHARE = 0.9       # ... or, when even rerunning every planned step in full is sure to cost less, this share
+REPLAY_RESERVE = 15           # seconds of DYNAMIC_BUDGET a full rerun must leave for the commits after it
 DYNAMIC_TIMEOUT = 8          # seconds for one import of the patched package (it normally takes half a second)
 DYNAMIC_BUDGET = 60          # seconds for all such imports and replays in a batch
 BATCH_BUDGET = 110           # after this many seconds every remaining commit simply runs everything
@@ -1147,7 +1149,7 @@ class Tree:
                    "BR_ROWS": os.path.join(self.prebuilt, "tpcds-rows.pkl"), "BR_SIGS": self.sigs}
             done = subprocess.run(
                 [sys.executable, "-S", "-P", "-B", os.path.join(os.path.dirname(self.script), "replay.py"), "check", self.root, plan_path],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=min(30.0, 3.0 + 1.5 * budget),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=min(45.0, 3.0 + 1.5 * budget),
             )
             if done.returncode != 0:
                 return {}
@@ -1407,11 +1409,20 @@ class Replay:
                 bits |= data["bit"][test]
             gain = (cost(mask) - cost(mask & ~bits)) / 1000.0
             estimate = 0.5 + sum(entry[1] for entry in chosen.values())
-            if gain <= 0 or estimate > REPLAY_SHARE * gain:
+            # Rerunning every step in full, with a tenth on top for a slower machine. The rerun
+            # stops at the first difference, so a test that really fails costs little of this.
+            worst = 1.1 * (0.5 + sum(entry[2] for entry in chosen.values()))
+            if gain <= 0:
                 continue
-            log("    replay: %d units for %d tests, about %.1f s for up to %.1f s" % (
-                sum(len(entry[0]) for entry in chosen.values()), len(chosen), estimate, gain))
-            verdict = self.tree.replay(files, {test: entry[0] for test, entry in chosen.items()}, REPLAY_SHARE * gain)
+            if worst <= REPLAY_FULL_SHARE * gain and self.tree.spent + 1.3 * worst <= DYNAMIC_BUDGET - REPLAY_RESERVE:
+                budget = 1.3 * worst      # certain to pay off if nothing differs: let it finish
+            elif estimate <= REPLAY_SHARE * gain:
+                budget = REPLAY_SHARE * gain
+            else:
+                continue
+            log("    replay: %d units for %d tests, about %.1f s (at most %.1f s) for up to %.1f s" % (
+                sum(len(entry[0]) for entry in chosen.values()), len(chosen), estimate, worst, gain))
+            verdict = self.tree.replay(files, {test: entry[0] for test, entry in chosen.items()}, budget)
             dropped = 0
             for test in chosen:
                 if verdict.get(test) is not True:
@@ -1448,7 +1459,8 @@ class Replay:
             elif thorough or touched >> position & 1:
                 wanted.append((seconds[name]["seconds"], name, 0))
         wanted.sort()
-        return [[name, how] for _cost, name, how in wanted], sum(entry[0] for entry in wanted)
+        worst = sum(seconds[name]["seconds"] for _cost, name, _how in wanted)
+        return [[name, how] for _cost, name, how in wanted], sum(entry[0] for entry in wanted), worst
 
 
 
@@ -1894,6 +1906,12 @@ def main():
     commits = os.path.join(DATA, "commits")
     started = time.monotonic()
     try:
+        # The run may take 3 minutes for about 40 commits and 4.5 for about 60: the time
+        # allowed for analysing patches grows with the number of commits.
+        global DYNAMIC_BUDGET, BATCH_BUDGET
+        count = sum(1 for name in os.listdir(commits) if name.endswith(".patch"))
+        DYNAMIC_BUDGET = min(100.0, max(DYNAMIC_BUDGET, 1.5 * count))
+        BATCH_BUDGET = min(180.0, max(BATCH_BUDGET, 2.75 * count))
         for name in sorted(os.listdir(commits)):
             if not name.endswith(".patch"):
                 continue

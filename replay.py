@@ -262,6 +262,13 @@ def check(root, plan, budget):
     if pinned["python"] != sys.version.split()[0] or pinned["seed"] != os.environ.get("PYTHONHASHSEED"):
         return {}
     pinned = pinned["units"]
+    try:
+        # A patch can turn a join into a cross product: fail with MemoryError (a difference)
+        # long before the machine runs out.
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (3 << 30, 3 << 30))
+    except Exception:
+        pass
     units = Units(root)
     verdict = {}
     started = time.process_time()
