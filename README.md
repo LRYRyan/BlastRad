@@ -53,8 +53,17 @@ see what the change really reaches.
    line are not rerun: they run the same code on the same input. This is only tried when the
    rerun is expected to cost at most half of what dropping the test saves, it stops at the
    first difference, and a test it cannot finish within that budget stays selected (the
-   remaining cost is projected from how the steps rerun so far went).
-6. **Other files** (SQL fixtures, CSV data, JSON) select the tests that opened them. New or
+   remaining cost is projected from how the steps rerun so far went). The same check covers
+   import-time changes that reach these tests only through lines naming a changed attribute:
+   those lines stand in for the change, and every parse, transpile and optimize step is
+   rerun on the patched package regardless of which lines it executed.
+6. **Other files** (SQL fixtures, CSV data, JSON) select the tests that opened them. Two
+   refinements for `.sql` fixtures, both read off `tests/helpers.py` at the pinned commit:
+   every loader drops empty lines and `--` lines first, so a patch that only touches such
+   lines selects nothing; and the two TPC query files, which the whole `TestExecutor` class
+   loads in `setUpClass` (60 tests open them, 3 use them), are loaded again from the patched
+   text and compared pair by pair, so a change to an expected output selects the optimizer
+   test that reads it and not the executor test that only runs the input query. New or
    removed files also select the tests that listed their directory. New pytest configuration, a
    new `conftest.py`, or a new importable top-level name selects everything.
 7. **Split**: for 1 to 8 workers, longest test first onto the lightest worker, tightened by

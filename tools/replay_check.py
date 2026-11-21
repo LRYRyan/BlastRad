@@ -1,6 +1,8 @@
 """Checks the replay (replay.py) against the truth (tools/replay_truth.py) on random mutants.
 
-usage: python3 tools/replay_check.py <scratch copy of the sqlglot checkout> <count> <seed>
+usage: python3 tools/replay_check.py <scratch copy of the sqlglot checkout> <count> <seed> [def]
+
+With `def`, only class- and module-level lines are mutated (changes at import time).
 
 For mutants that select one of the replayed tests, runs the selector with the replay, then
 recomputes everything those tests compute on the mutated tree. A test the replay dropped
@@ -10,6 +12,15 @@ after every mutant; make a fresh copy if the run is killed."""
 import ast, difflib, json, os, random, re, sys, importlib.util, subprocess, time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MUT, N, SEED = os.path.abspath(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+MODE = sys.argv[4] if len(sys.argv) > 4 else "any"
+_inside = {}
+def in_function(path, text, number):
+    """Is the line part of a function or lambda body?"""
+    spans = _inside.get(path)
+    if spans is None:
+        spans = _inside[path] = [(node.lineno, node.end_lineno) for node in ast.walk(ast.parse(text))
+                                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+    return any(first <= number <= last for first, last in spans)
 TRUTH = os.path.join(REPO, "tools", "replay_truth.py")
 spec = importlib.util.spec_from_file_location("selector", os.path.join(REPO, "selector.py"))
 sel = importlib.util.module_from_spec(spec); spec.loader.exec_module(sel)
@@ -49,6 +60,7 @@ while done < N:
     text = maps.text(path); lines = text.split("\n")
     number = rng.randrange(1, len(lines) + 1)
     if lines[number - 1].lstrip().startswith("#"): continue
+    if MODE == "def" and in_function(path, text, number): continue
     new_line = mutate_line(lines[number - 1], rng)
     if not new_line or new_line == lines[number - 1]: continue
     new_lines = lines[:]; new_lines[number - 1] = new_line; new_text = "\n".join(new_lines)

@@ -67,6 +67,7 @@ class Maps:
         with open(os.path.join(directory, "meta.json")) as handle:
             meta = json.load(handle)
         self.ids = meta["ids"]
+        self.position = {test: index for index, test in enumerate(self.ids)}
         self.width = meta["width"]
         self.files = meta["files"]
         self.data = meta["data"]
@@ -302,6 +303,22 @@ class Maps:
                 mask |= self.bitset(ident)
         self._word_cache[key] = mask
         return mask
+
+    def mention_ranges(self, words):
+        """{path: [(line, line)]} for every line of a Python file whose text contains one of
+        the identifiers."""
+        pattern = re.compile(r"(?<![A-Za-z0-9_])(?:%s)(?![A-Za-z0-9_])" % "|".join(re.escape(word) for word in sorted(words)))
+        found = {}
+        for path in self.files:
+            if not path.endswith(".py"):
+                continue
+            text = self.text(path)
+            if text is None or not any(word in text for word in words):
+                continue
+            lines = [(number, number) for number, content in enumerate(text.split("\n"), 1) if pattern.search(content)]
+            if lines:
+                found[path] = lines
+        return found
 
     def comparisons(self):
         """Comparison profile of the pinned run: site -> set of outcome strings, or None when absent."""
@@ -1247,9 +1264,16 @@ class Replay:
                     self.data = data
         return self.data
 
-    def drop(self, mask, strong, ranges, files, cost):
+    def possible(self, mask, strong):
+        data = self.load()
+        return bool(data) and any(mask & bit and not strong & bit for bit in data["bit"].values())
+
+    def drop(self, mask, strong, ranges, files, cost, thorough=False):
         """mask: selected tests; strong: tests selected for more than executing `ranges`
-        ({path: [(first, last)]}) at call time. Returns the tests proven unaffected."""
+        ({path: [(first, last)]}) at call time. Returns the tests proven unaffected.
+        thorough: rerun every parse, transpile and optimize step of a candidate, whether or
+        not its recorded execution contains a line of `ranges` (used when the lines are not
+        the change itself but where a changed attribute is named)."""
         data = self.load()
         if not data:
             return 0
@@ -1277,15 +1301,19 @@ class Replay:
                 flat = data["lines"].get(path, [])
                 covered = dict(zip(flat[0::2], flat[1::2]))
                 outside = set(always.get(path, ()))
+                inside = path.startswith(PACKAGE)
                 for first, last in spans:
                     for position in range(bisect_left(rows[0], first), bisect_right(rows[0], last)):
-                        if not maps.bitset(rows[1][position]) & bit:
+                        ran = maps.bitset(rows[1][position])
+                        if not inside:
+                            ran |= maps.bitset(rows[2][position]) | maps.bitset(rows[3][position])
+                        if not ran & bit:
                             continue  # the test never executed this line at call time
                         line = rows[0][position]
                         if line in outside or line not in covered or not data["sets"][covered[line]] & units:
                             explained = False
             if explained:
-                entry = self.plan(data, test, touched)
+                entry = self.plan(data, test, touched, thorough)
                 if entry[0]:  # nothing to rerun can only mean the maps disagree: keep the test
                     candidates[test] = entry
         if not candidates:
@@ -1315,7 +1343,7 @@ class Replay:
             return dropped
         return 0
 
-    def plan(self, data, test, touched):
+    def plan(self, data, test, touched, thorough=False):
         """([[unit, how]], estimated seconds) for the units of a test that must be rerun.
         how: 0 run it all; 1 stop after optimizing if the optimized query is the pinned one;
         2 nothing to run if the pickled query is the pinned one."""
@@ -1334,11 +1362,11 @@ class Replay:
                 parsed = touched >> index[name.replace(".C.", ".A.")] & 1
                 if pre or post:
                     wanted.append((seconds[name]["seconds"], name, 0))
-                elif opt:
+                elif opt or thorough:
                     wanted.append((seconds[name]["opt_seconds"], name, 1))
                 elif parsed:
                     wanted.append((0.01, name, 2))
-            elif touched >> position & 1:
+            elif thorough or touched >> position & 1:
                 wanted.append((seconds[name]["seconds"], name, 0))
         wanted.sort()
         return [[name, how] for _cost, name, how in wanted], sum(entry[0] for entry in wanted)
@@ -1364,21 +1392,29 @@ def class_of(maps, ref):
     return None
 
 
-def reached(maps, changed):
-    """Tests that can observe the given import-time differences."""
+def reached(maps, changed, notes=None):
+    """Tests that can observe the given import-time differences.
+
+    notes, when given, receives "words": the names whose mention on an executed line is the
+    whole reason some tests were chosen, and "strong": the tests chosen for any other reason."""
     mask = 0
+    words = set()
+    strong = 0
     for module, qualname, name, kind, entry_classes in changed:
         path = module_path(maps, module)
+        by_mention = ()
         if name == "!import":
             # The module stopped importing: everything that ever executed it.
             part = maps.whole(path) if path else maps.everything
             log("      %s no longer imports -> %d tests" % (module, bin(part).count("1")))
             mask |= part
+            strong |= part
             continue
         if path is None:
             # A module that did not exist at the pinned commit: only names can lead to it.
             part = maps.mentions((name,))
             mask |= part
+            strong |= part
             continue
         importers = maps.hits(path, 0, 1 << 30, DEF)
         if not qualname:
@@ -1386,6 +1422,8 @@ def reached(maps, changed):
             if kind == "c":
                 # A class can be looked up by a name held in data (serde): count whoever made one.
                 part |= maps.users(path, name) or 0
+            elif kind != "f":
+                by_mention = (name,)
         else:
             users = maps.users(path, qualname)
             simple = qualname.rsplit(".", 1)[-1]
@@ -1400,8 +1438,10 @@ def reached(maps, changed):
                 part = users if users is not None else importers
             elif users is not None:
                 part = (users & maps.mentions((name,))) | maps.mentions((simple, name))
+                by_mention = (name,)
             else:
                 part = (maps.mentions((name,)) | maps.mentions((simple,))) & importers
+                by_mention = (name, simple)
         if entry_classes:
             narrowed = 0
             for ref in entry_classes:
@@ -1418,6 +1458,13 @@ def reached(maps, changed):
             module, qualname, name, kind,
             ", %d entries" % len(entry_classes) if entry_classes else "", bin(part).count("1")))
         mask |= part
+        if by_mention:
+            words.update(by_mention)
+        else:
+            strong |= part
+    if notes is not None:
+        notes["words"] = words
+        notes["strong"] = strong
     return mask
 
 
@@ -1425,6 +1472,86 @@ def reached(maps, changed):
 
 PYTEST_FILES = {"pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "pytest.toml", ".pytest.toml"}
 STARTUP_MODULES = {"conftest.py", "sitecustomize.py", "usercustomize.py"}
+
+
+# What the tests' fixture loaders (tests/helpers.py at the pinned commit) do with a .sql
+# fixture: every reader goes through _filter_comments, which drops empty lines and lines that
+# start with "--" before anything else looks at the text.
+LINE_BREAKS = ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+
+# The two TPC query files are loaded once for the whole TestExecutor class (setUpClass), so
+# all its tests open them, but only these use what was loaded, and each a different part:
+# "all" the metadata, query and expected text of every pair; "input" metadata and query;
+# "pair" query and expected text.
+FIXTURE_PAIR_USERS = {
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": {
+        "tests/test_optimizer.py::TestOptimizer::test_tpcds": "all",
+        "tests/test_executor.py::TestExecutor::test_execute_tpcds": "input",
+    },
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql": {
+        "tests/test_optimizer.py::TestOptimizer::test_tpch": "all",
+        "tests/test_executor.py::TestExecutor::test_execute_tpch": "input",
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch": "pair",
+    },
+}
+
+
+def fixture_pairs(text):
+    """tests.helpers.load_sql_fixture_pairs, on a text instead of a file. Raises what it raises."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")  # as a file opened in text mode reads
+    kept = "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+    statements = kept.split(";")
+    pairs = []
+    for index in range(0, len(statements) - 1, 2):
+        lines = statements[index].strip().split("\n")
+        meta = {}
+        cursor = 0
+        while lines[cursor].startswith("#"):
+            key, value = lines[cursor].split(":", maxsplit=1)
+            meta[key.lstrip("#").strip()] = value.strip()
+            cursor += 1
+        pairs.append((meta, "\n".join(lines[cursor:]), statements[index + 1].strip()))
+    return pairs
+
+
+def data_file(maps, path, change):
+    """(tests, reason) for a change to a file tests read as data."""
+    readers = maps.readers(path)
+    if not readers or change.binary or not (path.startswith("tests/fixtures/") and path.endswith(".sql")):
+        return readers, "data file"
+    changed = [content for _o, _n, body in change.hunks for tag, content in body if tag != " "]
+    if changed and all(
+        line.rstrip("\r") == "" or (line.startswith("--") and not any(mark in line.rstrip("\r") for mark in LINE_BREAKS))
+        for line in changed
+    ) and not any("\r" in line[:-1] for line in changed):
+        return 0, "fixture: only comment and empty lines differ"
+    users = FIXTURE_PAIR_USERS.get(path)
+    pinned = os.path.join(maps.directory, "tpc", path[len("tests/fixtures/optimizer/"):]) if users else None
+    if not users or not os.path.exists(pinned) or any(test not in maps.position for test in users):
+        return readers, "data file"
+    try:
+        with open(pinned, encoding="utf-8", newline="") as handle:
+            old_text = handle.read()
+        applied = apply_hunks(old_text.split("\n"), change.hunks)
+        if applied is None:
+            return readers, "data file (patch does not apply)"
+        new_text = "\n".join(applied[0])
+        new_text.encode("utf-8")           # undecodable bytes would stop the loader for everyone
+        old_pairs = fixture_pairs(old_text)
+        new_pairs = fixture_pairs(new_text)
+    except Exception:
+        return readers, "data file (does not load)"
+    views = {
+        "all": lambda pairs: pairs,
+        "input": lambda pairs: [(meta, sql) for meta, sql, _expected in pairs],
+        "pair": lambda pairs: [(sql, expected) for _meta, sql, expected in pairs],
+    }
+    part = 0
+    for test, view in users.items():
+        if views[view](old_pairs) != views[view](new_pairs):
+            part |= 1 << maps.position[test]
+    return part & readers, "fixture pairs (%d of %d differ)" % (
+        sum(1 for a, b in zip(old_pairs, new_pairs) if a != b) + abs(len(old_pairs) - len(new_pairs)), len(old_pairs))
 
 
 def added_text(change):
@@ -1487,8 +1614,7 @@ def select(maps, text, tree, cost, replay=None):
                     bodies[old] = outcome.new_text
                     explained = True
             else:
-                part = maps.readers(old)
-                why = "data file"
+                part, why = data_file(maps, old, change)
         base = os.path.basename(new or old)
         if base in PYTEST_FILES and (new or old).count("/") <= 1:
             if base in ("pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml") or "pytest" in added_text(change):
@@ -1512,12 +1638,23 @@ def select(maps, text, tree, cost, replay=None):
                 changed = tree.compare(files)
                 if changed is not None:
                     log("    import-time state: %d names differ" % len(changed))
-                    narrowed = reached(maps, changed) if len(changed) <= 2000 else None
+                    notes = {}
+                    narrowed = reached(maps, changed, notes) if len(changed) <= 2000 else None
             if narrowed is None:
                 mask |= importers
             else:
                 broken = any(entry[2] == "!import" for entry in changed)
                 mask |= narrowed if broken else narrowed & importers
+                if not broken and not moved and replay is not None and notes["words"]:
+                    # Tests chosen only because they executed a line naming a changed attribute:
+                    # for the replayed ones, those lines stand in for the change.
+                    strong |= notes["strong"]
+                    if replay.possible(mask, strong | maps.unmapped):
+                        for path, spans in maps.mention_ranges(notes["words"]).items():
+                            ranges[path] = sorted(set(ranges.get(path, [])) | set(spans))
+                        for path, (_m, new_text) in at_import.items():
+                            bodies[path] = new_text
+                        mask &= ~replay.drop(mask, strong | maps.unmapped, ranges, bodies, cost, thorough=True)
     if replay is not None and mask and ranges and not at_import and not moved:
         mask &= ~replay.drop(mask, strong | maps.unmapped, ranges, bodies, cost)
     if active:
