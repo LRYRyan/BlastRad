@@ -62,11 +62,28 @@ def _merge_helpers(directory, data):
     data["helpers"] = helpers
 
 
+ALWAYS = {"test_execute_tpch": "tpc-h", "test_execute_tpcds": "tpc-ds", "test_optimized_tpch": None}
+
+
+def _without_queries(item):
+    """BR_ALWAYS: run one of the replayed tests (see replay.py) with its queries taken out, so
+    that what remains is the part every query shares: class setup, the process pool, teardown.
+    One placeholder that needs no sqlglot keeps the pool starting its workers."""
+    import tests.test_executor as module
+
+    wanted = ALWAYS[item.name]
+    module.load_sql_fixture_pairs = lambda filename: iter([({}, "x", "")] if wanted and wanted in filename else [])
+    module.parse_one = lambda sql: 0
+
+
 def pytest_runtestloop(session):
     collection = br_core.snapshot()
     results = {}
     classes = {}
+    always = bool(os.environ.get("BR_ALWAYS"))
     for item in session.items:
+        if always and item.name not in ALWAYS:
+            continue
         read_fd, write_fd = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -76,6 +93,8 @@ def pytest_runtestloop(session):
                 _state["outcome"] = "passed"
                 spawn_dir = tempfile.mkdtemp(prefix="br-")
                 os.environ["BR_SPAWN_DIR"] = spawn_dir
+                if always:
+                    _without_queries(item)
                 br_core.reset()
                 _state["in_test"] = True
                 try:

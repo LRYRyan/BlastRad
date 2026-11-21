@@ -1,0 +1,2 @@
+# Keep every file byte for byte: Windows line-ending conversion would break the patches and scripts.
+* -text

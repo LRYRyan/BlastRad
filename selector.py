@@ -46,8 +46,9 @@ MAX_WORKERS = 8
 RUN, IMP, DEF = 1, 2, 4
 PACKAGE = "sqlglot/"          # the tree fingerprint.py can import
 DYNAMIC_GAIN_MS = int(os.environ.get("BR_DYNAMIC_GAIN_MS", "2000"))  # import the patch only if it can save this much
+REPLAY_SHARE = 0.5            # rerun parts of a slow test only if that costs at most this share of what it can save
 DYNAMIC_TIMEOUT = 8          # seconds for one import of the patched package (it normally takes half a second)
-DYNAMIC_BUDGET = 40          # seconds for all such imports in a batch
+DYNAMIC_BUDGET = 60          # seconds for all such imports and replays in a batch
 BATCH_BUDGET = 110           # after this many seconds every remaining commit simply runs everything
 SCRATCH = os.environ.get("BR_SCRATCH", "/tmp/blast-radius-%d" % os.getpid())
 
@@ -604,6 +605,8 @@ class PyDiff:
         self.importers = 0
         self.changed = False
         self.at_import = False
+        self.ranges = []   # line ranges whose call-time execution selected tests
+        self.strong = 0    # tests selected for any other reason than executing those ranges at call time
         self.checks = []  # new-side nodes worth compiling for late syntax errors
         self.future_annotations = any(
             isinstance(node, ast.ImportFrom) and node.module == "__future__"
@@ -618,12 +621,22 @@ class PyDiff:
     def run_hits(self, first, last):
         return self.maps.hits(self.path, first, last, RUN | IMP)
 
-    def reached_hits(self, first, last, function):
-        """Tests that executed lines [first, last] of a function; the whole function when
-        nothing in that range can show up in a trace (`global x`, a bare annotation, ...)."""
+    def reached(self, first, last, function):
+        """The range whose execution stands for lines [first, last] of a function: the lines
+        themselves, or the whole function when nothing in them can show up in a trace
+        (`global x`, a bare annotation, ...)."""
         if self.maps.traceable(self.path, first, last):
-            return self.maps.hits(self.path, first, last)
-        return self.run_hits(first_line(function), function.end_lineno)
+            return first, last, RUN | IMP | DEF
+        return first_line(function), function.end_lineno, RUN | IMP
+
+    def call_time(self, what, first, last, kinds=RUN | IMP | DEF):
+        """A change that matters to the tests that executed lines [first, last].
+
+        A range that is a whole function takes kinds=RUN | IMP: its `def` line and decorators
+        also execute in the enclosing class or module body at import, which is not a call."""
+        self.ranges.append((first, last))
+        self.strong |= self.maps.hits(self.path, first, last, kinds & (IMP | DEF))
+        self.note(what, first, last, self.maps.hits(self.path, first, last, kinds))
 
     def def_hits(self, first, last):
         return self.maps.hits(self.path, first, last, DEF)
@@ -773,16 +786,16 @@ class PyDiff:
             # Callers run the body; a new name or decorator also changes what the import leaves behind.
             body = self.run_hits(first, last)
             if function is not None:
-                self.note("nested function", first, last, body)
+                self.call_time("nested function", first, last, RUN | IMP)
             elif old.name != new.name or ast.dump(ast.Module(body=old.decorator_list, type_ignores=[])) != ast.dump(
                 ast.Module(body=new.decorator_list, type_ignores=[])
             ):
                 self.note("function definition", first, last, body, self.def_hits(first, old.lineno))
             else:
-                self.note("function signature", first, last, body)
+                self.call_time("function signature", first, last, RUN | IMP)
         elif isinstance(old, ast.ClassDef):
             if function is not None:
-                self.note("nested class header", first, old.lineno, self.maps.hits(self.path, first, old.lineno))
+                self.call_time("nested class header", first, old.lineno)
             else:
                 self.note("class header", first, old.lineno, 0, self.def_hits(first, old.lineno))
         else:
@@ -790,12 +803,12 @@ class PyDiff:
             if function is None:
                 self.note("import-time block", first, last, 0, self.def_hits(first, last))
             else:
-                self.note("block header", first, last, self.reached_hits(first, last, function))
+                self.call_time("block header", *self.reached(first, last, function))
 
     def statement_changed(self, old, new, function, klass):
         first, last = first_line(old), old.end_lineno
         if function is not None:
-            self.note("statement", first, last, self.reached_hits(first, last, function))
+            self.call_time("statement", *self.reached(first, last, function))
             return
         # Import-time statement.
         if isinstance(old, FUNCTIONS):
@@ -806,13 +819,18 @@ class PyDiff:
             return
         if new is not None and type(old) is type(new) and masked_dump(old) == masked_dump(new):
             # Only the inside of lambdas changed: they run when called, not at import.
-            mask = 0
-            found = False
-            for inner in ast.walk(old):
-                if isinstance(inner, ast.Lambda) and touched(inner.lineno, inner.end_lineno, self.old_ranges):
-                    found = True
-                    mask |= self.run_hits(inner.lineno, inner.end_lineno)
-            if found:
+            spans = [
+                (inner.lineno, inner.end_lineno) for inner in ast.walk(old)
+                if isinstance(inner, ast.Lambda) and touched(inner.lineno, inner.end_lineno, self.old_ranges)
+            ]
+            if spans:
+                # Lines of a lambda also run at import (building the table): only call-time
+                # execution, or execution inside a function during an import, is the lambda itself.
+                mask = 0
+                for low, high in spans:
+                    mask |= self.run_hits(low, high)
+                    self.ranges.append((low, high))
+                    self.strong |= self.maps.hits(self.path, low, high, IMP)
                 self.note("lambda", first, last, mask)
                 return
         self.note("import-time statement", first, last, self.run_hits(first, last), self.def_hits(first, last))
@@ -825,7 +843,7 @@ class PyDiff:
                 anchor = siblings[cursor]
                 first, last = first_line(anchor), anchor.end_lineno
                 if self.maps.traceable(self.path, first, last):
-                    self.note("insert after", first, last, self.maps.hits(self.path, first, last))
+                    self.call_time("insert after", first, last)
                     return
                 cursor -= 1
             if parent is not function and parent is not None:
@@ -833,10 +851,9 @@ class PyDiff:
                 if isinstance(parent, ast.Try) or (hasattr(ast, "TryStar") and isinstance(parent, ast.TryStar)):
                     last = parent.end_lineno
                 if self.maps.traceable(self.path, first, last):
-                    self.note("insert in block", first, last, self.maps.hits(self.path, first, last))
+                    self.call_time("insert in block", first, last)
                     return
-            self.note("insert in function", first_line(function), function.end_lineno,
-                      self.run_hits(first_line(function), function.end_lineno))
+            self.call_time("insert in function", first_line(function), function.end_lineno, RUN | IMP)
             return
         # Import time: everything that imported the enclosing class or module.
         if klass is not None:
@@ -865,13 +882,15 @@ OLD_TREES = {}
 class Outcome:
     """What one changed file selects. importers is None when nothing changed at import time."""
 
-    __slots__ = ("mask", "importers", "why", "new_text")
+    __slots__ = ("mask", "importers", "why", "new_text", "ranges", "strong")
 
-    def __init__(self, mask, why, importers=None, new_text=None):
+    def __init__(self, mask, why, importers=None, new_text=None, ranges=None, strong=None):
         self.mask = mask
         self.why = why
         self.importers = importers
         self.new_text = new_text
+        self.ranges = ranges        # None: not explained by executed line ranges alone
+        self.strong = mask if strong is None else strong
 
 
 def python_file(maps, path, change):
@@ -906,14 +925,14 @@ def python_file(maps, path, change):
     diff = PyDiff(maps, path, old_tree, new_tree, blocks)
     diff.diff_module()
     if not diff.changed:
-        return Outcome(0, "same syntax tree")
+        return Outcome(0, "same syntax tree", ranges=[], new_text=new_text)
     for new_function, nodes in diff.checks:
         if not compiles(new_function, nodes):
             return Outcome(maps.whole(path), "does not compile")
     mask = diff.body | maps.readers(path)
     if diff.at_import:
         return Outcome(mask, "changed at import time", diff.importers, new_text)
-    return Outcome(mask, "changed")
+    return Outcome(mask, "changed", new_text=new_text, ranges=diff.ranges, strong=diff.strong | maps.readers(path))
 
 
 # --------------------------------------------------------------------------- import-time state
@@ -929,6 +948,9 @@ class Tree:
         self.script = os.path.join(here, "fingerprint.py")
         self.prebuilt = os.path.join(here, "tree")       # sources and bytecode laid out at image build
         self.baseline = os.path.join(maps.directory, "fingerprint.bin")
+        if os.path.exists(os.path.join(self.prebuilt, "fingerprint.bin")):
+            self.baseline = os.path.join(self.prebuilt, "fingerprint.bin")  # redone at image build for its Python
+        self.sigs = os.path.join(self.prebuilt, "replay-sigs.json")   # pinned replay results, made at image build
         self.spent = 0.0
 
     def prepare(self):
@@ -936,7 +958,8 @@ class Tree:
             return
         self.root = os.path.join(SCRATCH, "tree")
         if os.path.isdir(os.path.join(self.prebuilt, "sqlglot")):
-            shutil.copytree(self.prebuilt, self.root)
+            # The table rows and CSV files stay where they are: only replay.py reads them.
+            shutil.copytree(self.prebuilt, self.root, ignore=shutil.ignore_patterns("tpcds-rows.pkl", "*.csv.gz"))
         else:
             lay_out(self.maps, self.root)
 
@@ -954,6 +977,57 @@ class Tree:
             self.spent += time.monotonic() - started
         return done.returncode, done.stdout.decode("utf-8", "replace")
 
+    def patch(self, files, saved):
+        """Writes the patched files into the tree, remembering how to put the pinned ones back."""
+        for path, text in files.items():
+            target = os.path.join(self.root, path)
+            cache = bytecode_path(target)
+            state = None
+            if os.path.exists(target):
+                with open(target, "rb") as handle:
+                    state = (handle.read(), os.stat(target))
+            compiled = None
+            if os.path.exists(cache):
+                with open(cache, "rb") as handle:
+                    compiled = handle.read()
+                os.remove(cache)
+            saved[path] = (state, compiled)
+            if text is None:
+                if state is not None:
+                    os.remove(target)
+            else:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
+                    handle.write(text)
+
+    def replay(self, files, plan, budget):
+        """Reruns replay units (replay.py) on the patched tree, for at most `budget` CPU seconds.
+        Returns {test id: still passes}; a test it could not finish is absent."""
+        if self.spent > DYNAMIC_BUDGET or not os.path.exists(self.sigs):
+            return {}
+        self.prepare()
+        saved = {}
+        started = time.monotonic()
+        try:
+            self.patch(files, saved)
+            plan_path = os.path.join(SCRATCH, "plan.json")
+            with open(plan_path, "w") as handle:
+                json.dump({"budget": budget, "tests": plan}, handle)
+            env = {"PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"),
+                   "BR_ROWS": os.path.join(self.prebuilt, "tpcds-rows.pkl"), "BR_SIGS": self.sigs}
+            done = subprocess.run(
+                [sys.executable, "-S", "-P", "-B", os.path.join(os.path.dirname(self.script), "replay.py"), "check", self.root, plan_path],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=min(30.0, 3.0 + 1.5 * budget),
+            )
+            if done.returncode != 0:
+                return {}
+            return json.loads(done.stdout.decode("utf-8", "replace") or "{}")
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return {}
+        finally:
+            self.spent += time.monotonic() - started
+            self.restore(saved)
+
     def compare(self, files):
         """files: {path: new text or None}. Returns the names whose import-time value differs,
         as (module, class qualname, name, kind, differing entry classes or None), or None
@@ -963,26 +1037,7 @@ class Tree:
         self.prepare()
         saved = {}
         try:
-            for path, text in files.items():
-                target = os.path.join(self.root, path)
-                cache = bytecode_path(target)
-                state = None
-                if os.path.exists(target):
-                    with open(target, "rb") as handle:
-                        state = (handle.read(), os.stat(target))
-                compiled = None
-                if os.path.exists(cache):
-                    with open(cache, "rb") as handle:
-                        compiled = handle.read()
-                    os.remove(cache)
-                saved[path] = (state, compiled)
-                if text is None:
-                    if state is not None:
-                        os.remove(target)
-                else:
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    with open(target, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
-                        handle.write(text)
+            self.patch(files, saved)
             code, output = self.run("--against", self.baseline)
             if code == 3:
                 # Maps were built by another Python: make a baseline with this one, once.
@@ -1027,34 +1082,42 @@ class Tree:
         code, output = self.run()
         if code != 0 or not output:
             return False
-        with open(self.baseline, "rb") as handle:
-            modes = {}
-            for line in zlib.decompress(handle.read()).decode().split("\n"):
-                parts = line.split("\t")
-                if len(parts) >= 6:
-                    modes[(parts[0], parts[1], parts[2])] = parts[4]
-        lines = []
-        for line in output.split("\n"):
-            parts = line.split("\t")
-            if parts[0] == "#python":
-                lines.append(line)
-            elif len(parts) >= 6:
-                mode = modes.get((parts[0], parts[1], parts[2]), "o")
-                which = 1 if mode == "b" else 0
-                row = parts[:4] + [mode, "" if mode == "v" else parts[4 + which]]
-                if len(parts) > 6 and parts[6][:1] == "@":
-                    row.append(parts[6])
-                elif mode != "v" and len(parts) > 6 and parts[6]:
-                    row.append(",".join(e.split("=")[0] + "=" + e.split("=")[1].split("/")[which] for e in parts[6].split(",")))
-                lines.append("\t".join(row))
+        shipped = self.baseline
         self.baseline = os.path.join(SCRATCH, "fingerprint.bin")
         with open(self.baseline, "wb") as handle:
-            handle.write(zlib.compress("\n".join(lines).encode(), 1))
+            handle.write(rebased(output, shipped))
         return True
 
     def close(self):
         if self.root is not None:
             shutil.rmtree(SCRATCH, ignore_errors=True)
+
+
+def rebased(output, shipped):
+    """A fingerprint baseline from fingerprint.py's full output for the pinned tree, keeping for
+    every name the stability mode recorded in the shipped baseline (bytecode digests only
+    compare within one Python version; which names are order-unstable does not change)."""
+    with open(shipped, "rb") as handle:
+        modes = {}
+        for line in zlib.decompress(handle.read()).decode().split("\n"):
+            parts = line.split("\t")
+            if len(parts) >= 6:
+                modes[(parts[0], parts[1], parts[2])] = parts[4]
+    lines = []
+    for line in output.split("\n"):
+        parts = line.split("\t")
+        if parts[0] == "#python":
+            lines.append(line)
+        elif len(parts) >= 6:
+            mode = modes.get((parts[0], parts[1], parts[2]), "o")
+            which = 1 if mode == "b" else 0
+            row = parts[:4] + [mode, "" if mode == "v" else parts[4 + which]]
+            if len(parts) > 6 and parts[6][:1] == "@":
+                row.append(parts[6])
+            elif mode != "v" and len(parts) > 6 and parts[6]:
+                row.append(",".join(e.split("=")[0] + "=" + e.split("=")[1].split("/")[which] for e in parts[6].split(",")))
+            lines.append("\t".join(row))
+    return zlib.compress("\n".join(lines).encode(), 6)
 
 
 def bytecode_path(source):
@@ -1064,13 +1127,140 @@ def bytecode_path(source):
 
 
 def lay_out(maps, root):
-    """Writes the pinned package sources under root."""
+    """Writes the pinned package sources under root, and what replay.py needs beside them."""
     for path in maps.src:
-        if path.startswith(PACKAGE):
+        if path.startswith(PACKAGE) or path in ("tests/__init__.py", "tests/helpers.py"):
             target = os.path.join(root, path)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
                 handle.write(maps.text(path))
+    fixtures = os.path.join(maps.directory, "tpc")
+    if os.path.isdir(fixtures):
+        shutil.copytree(fixtures, os.path.join(root, "tests", "fixtures", "optimizer"), dirs_exist_ok=True)
+
+
+class Replay:
+    """Decides which of the slow replayable tests (replay.py) a call-time change can be checked
+    against cheaply, and drops the ones whose computation comes out unchanged."""
+
+    def __init__(self, maps, tree):
+        self.maps = maps
+        self.tree = tree
+        self.data = None
+
+    def load(self):
+        if self.data is None:
+            self.data = False
+            path = os.path.join(self.maps.directory, "replay.json")
+            if os.path.exists(path) and os.path.exists(self.tree.sigs):
+                with open(path) as handle:
+                    data = json.load(handle)
+                with open(self.tree.sigs) as handle:
+                    sigs = json.load(handle)
+                if sigs.get("python") == sys.version.split()[0]:
+                    position = {test: index for index, test in enumerate(self.maps.ids)}
+                    data["sets"] = [int(text, 16) for text in data["sets"]]
+                    data["bit"] = {test: 1 << position[test] for test in data["tests"] if test in position}
+                    data["mask"] = {test: sum(1 << unit for unit in units) for test, units in data["tests"].items()}
+                    data["seconds"] = sigs["units"]
+                    self.data = data
+        return self.data
+
+    def drop(self, mask, strong, ranges, files, cost):
+        """mask: selected tests; strong: tests selected for more than executing `ranges`
+        ({path: [(first, last)]}) at call time. Returns the tests proven unaffected."""
+        data = self.load()
+        if not data:
+            return 0
+        maps = self.maps
+        touched = 0          # units whose recorded execution contains a changed line
+        for path, spans in ranges.items():
+            flat = data["lines"].get(path)
+            if not flat:
+                continue
+            lines = flat[0::2]
+            for first, last in spans:
+                for position in range(bisect_left(lines, first), bisect_right(lines, last)):
+                    touched |= data["sets"][flat[2 * position + 1]]
+        candidates = {}
+        for test, bit in data["bit"].items():
+            if not mask & bit or strong & bit:
+                continue
+            units = data["mask"][test]
+            always = data["always"].get(test, {})
+            explained = True
+            for path, spans in ranges.items():
+                rows = maps.rows(path)
+                if rows is None:
+                    continue
+                flat = data["lines"].get(path, [])
+                covered = dict(zip(flat[0::2], flat[1::2]))
+                outside = set(always.get(path, ()))
+                for first, last in spans:
+                    for position in range(bisect_left(rows[0], first), bisect_right(rows[0], last)):
+                        if not maps.bitset(rows[1][position]) & bit:
+                            continue  # the test never executed this line at call time
+                        line = rows[0][position]
+                        if line in outside or line not in covered or not data["sets"][covered[line]] & units:
+                            explained = False
+            if explained:
+                entry = self.plan(data, test, touched)
+                if entry[0]:  # nothing to rerun can only mean the maps disagree: keep the test
+                    candidates[test] = entry
+        if not candidates:
+            return 0
+        # Cheapest useful subset: everything, or everything but the expensive ones.
+        for limit in (None, 1.5):
+            chosen = {test: entry for test, entry in candidates.items() if limit is None or entry[1] <= limit}
+            if not chosen:
+                continue
+            bits = 0
+            for test in chosen:
+                bits |= data["bit"][test]
+            gain = (cost(mask) - cost(mask & ~bits)) / 1000.0
+            estimate = 0.5 + sum(entry[1] for entry in chosen.values())
+            if gain <= 0 or estimate > REPLAY_SHARE * gain:
+                continue
+            log("    replay: %d units for %d tests, about %.1f s for up to %.1f s" % (
+                sum(len(entry[0]) for entry in chosen.values()), len(chosen), estimate, gain))
+            verdict = self.tree.replay(files, {test: entry[0] for test, entry in chosen.items()}, REPLAY_SHARE * gain)
+            dropped = 0
+            for test in chosen:
+                if verdict.get(test) is True:
+                    dropped |= data["bit"][test]
+                    log("      unchanged: %s" % test)
+            return dropped
+        return 0
+
+    def plan(self, data, test, touched):
+        """([[unit, how]], estimated seconds) for the units of a test that must be rerun.
+        how: 0 run it all; 1 stop after optimizing if the optimized query is the pinned one;
+        2 nothing to run if the pickled query is the pinned one."""
+        names = data["units"]
+        seconds = data["seconds"]
+        index = {name: position for position, name in enumerate(names)}
+        wanted = []
+        seen = set()
+        for position in data["tests"][test]:
+            name = names[position].split("/")[0]   # ds.C units are recorded as three parts
+            if name in seen:
+                continue
+            seen.add(name)
+            if ".C." in name:
+                pre, opt, post = (touched >> index["%s/%s" % (name, phase)] & 1 for phase in ("pre", "opt", "post"))
+                parsed = touched >> index[name.replace(".C.", ".A.")] & 1
+                if pre or post:
+                    wanted.append((seconds[name]["seconds"], name, 0))
+                elif opt:
+                    wanted.append((seconds[name]["opt_seconds"], name, 1))
+                elif parsed:
+                    wanted.append((0.01, name, 2))
+            elif touched >> position & 1:
+                wanted.append((seconds[name]["seconds"], name, 0))
+        wanted.sort()
+        return [[name, how] for _cost, name, how in wanted], sum(entry[0] for entry in wanted)
+
+
 
 
 def module_path(maps, module):
@@ -1154,10 +1344,13 @@ def added_text(change):
     return "\n".join(content for _o, _n, body in change.hunks for tag, content in body if tag == "+")
 
 
-def select(maps, text, tree, cost):
+def select(maps, text, tree, cost, replay=None):
     """Returns (bitset of affected tests, True when anything might have changed)."""
     mask = 0
     active = False
+    strong = 0        # tests selected for more than executing changed lines of the package at call time
+    ranges = {}       # package path -> those line ranges
+    bodies = {}       # package path -> patched text, for files changed only inside functions
     at_import = {}    # path -> (importers, new text) for package files changed at import time
     moved = {}        # package files the patch adds (text) or removes (None)
     for change in parse_patch(text):
@@ -1173,6 +1366,7 @@ def select(maps, text, tree, cost):
             continue
         part = 0
         why = ""
+        explained = False
         if old is not None and (new is None or new != old):
             # Removed or moved away.
             part |= maps.whole(old) | maps.listers(os.path.dirname(old))
@@ -1200,6 +1394,11 @@ def select(maps, text, tree, cost):
                         at_import[old] = (outcome.importers, outcome.new_text)
                     else:
                         part |= outcome.importers
+                elif outcome.ranges is not None and old.startswith(PACKAGE):
+                    strong |= outcome.strong
+                    ranges[old] = outcome.ranges
+                    bodies[old] = outcome.new_text
+                    explained = True
             else:
                 part = maps.readers(old)
                 why = "data file"
@@ -1210,6 +1409,8 @@ def select(maps, text, tree, cost):
                 why = "pytest configuration"
         if part or why not in ("same syntax tree", "no change"):
             active = True
+        if not explained or why == "pytest configuration":
+            strong |= part
         log("  %s: %s -> %d tests" % (new or old, why, bin(part).count("1")))
         mask |= part
     if at_import:
@@ -1230,6 +1431,8 @@ def select(maps, text, tree, cost):
             else:
                 broken = any(entry[2] == "!import" for entry in changed)
                 mask |= narrowed if broken else narrowed & importers
+    if replay is not None and mask and ranges and not at_import and not moved:
+        mask &= ~replay.drop(mask, strong | maps.unmapped, ranges, bodies, cost)
     if active:
         mask |= maps.unmapped  # tests the maps know nothing about (none when all passed while tracing)
     return mask, active
@@ -1328,6 +1531,18 @@ def prepare(root):
     maps = Maps(MAPS)
     lay_out(maps, root)
     compileall.compile_dir(root, quiet=1, workers=1)
+    here = os.path.dirname(os.path.abspath(__file__))
+    # The pinned import-time fingerprint with this very interpreter (bytecode differs between
+    # Python releases), so that no run has to redo it.
+    done = subprocess.run([sys.executable, "-I", "-S", "-B", os.path.join(here, "fingerprint.py"), root],
+                          check=True, stdout=subprocess.PIPE)
+    with open(os.path.join(root, "fingerprint.bin"), "wb") as handle:
+        handle.write(rebased(done.stdout.decode(), os.path.join(MAPS, "fingerprint.bin")))
+    script = os.path.join(here, "replay.py")
+    if os.path.isdir(os.path.join(root, "tests", "fixtures")) and os.path.exists(script):
+        # What the replayed tests compute on the pinned tree, with this very interpreter.
+        subprocess.run([sys.executable, "-S", "-P", "-B", script, "sigs", root], check=True,
+                       env=dict(os.environ, PYTHONHASHSEED="0"), stdout=subprocess.DEVNULL)
     for directory, _subdirs, files in os.walk(root):
         os.chmod(directory, 0o755)
         for name in files:
@@ -1368,6 +1583,7 @@ def main():
         return split([(millis[number], number) for number in numbers_of(mask)])[0]
 
     tree = Tree(maps)
+    replay = Replay(maps, tree)
     out = []
     commits = os.path.join(DATA, "commits")
     started = time.monotonic()
@@ -1382,7 +1598,7 @@ def main():
                     raise TimeoutError("batch budget spent")
                 with open(os.path.join(commits, name), "rb") as handle:
                     text = handle.read().decode("utf-8", "surrogateescape")
-                mask, active = select(maps, text, tree, cost)
+                mask, active = select(maps, text, tree, cost, replay)
                 numbers = numbers_of(mask)
                 if active:
                     numbers.extend(strangers)

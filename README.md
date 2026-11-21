@@ -13,6 +13,7 @@ see what the change really reaches.
 | --- | --- |
 | `selector.py` | Reads `/data`, prints one JSON line per commit. Standard library only. |
 | `fingerprint.py` | Digest of everything sqlglot defines at import time, for comparing a patched tree with the pinned one. |
+| `replay.py` | Recomputes, on a patched tree, what three slow executor tests compute with sqlglot, to see whether they can still pass. |
 | `maps/` | What every test depends on at the pinned commit. Built by `tools/`, committed as plain files. |
 | `tools/` | Records the maps: a pytest plugin, a driver, the map builder, and the image they run in. Also the checks described below. |
 | `Dockerfile` | The submission image. Copies the files above; downloads nothing and runs no test. |
@@ -40,10 +41,20 @@ see what the change really reaches.
    by metaclasses. The selection then shrinks to tests that instantiated those classes and
    executed, at call time, a line that mentions those names. If the patched package no longer
    imports, every test that used the broken module is selected.
-5. **Other files** (SQL fixtures, CSV data, JSON) select the tests that opened them. New or
+5. **Three slow tests are checked instead of assumed.** `test_execute_tpcds` (21.5 s recorded),
+   `test_execute_tpch` and `test_optimized_tpch` spend their time in duckdb, pandas and a
+   process pool; what they ask of sqlglot is to parse, pickle, transpile and execute a fixed
+   list of TPC queries. When a call-time change selects one of them, `replay.py` reruns, on
+   the patched tree, the query steps whose recorded line coverage contains a changed line and
+   compares the outcome (duckdb text, result rows, no exception) with the pinned one. If
+   nothing differs the test cannot fail and is dropped. Steps that never executed a changed
+   line are not rerun: they run the same code on the same input. This is only tried when the
+   rerun is expected to cost at most half of what dropping the test saves, it stops at the
+   first difference, and a test it cannot finish within that budget stays selected.
+6. **Other files** (SQL fixtures, CSV data, JSON) select the tests that opened them. New or
    removed files also select the tests that listed their directory. New pytest configuration, a
    new `conftest.py`, or a new importable top-level name selects everything.
-6. **Split**: for 1 to 8 workers, longest test first onto the lightest worker, tightened by
+7. **Split**: for 1 to 8 workers, longest test first onto the lightest worker, tightened by
    first-fit with a binary search on the capacity; the cheapest `largest load + 2 s x workers`
    wins.
 
@@ -67,7 +78,14 @@ tests use process pools) are recorded too.
   running the suite with comparisons rewritten to a recording helper that returns exactly
   what the original comparison returns. A comparison seen with too many distinct
   non-primitive operands is marked as given up and never trusted.
+- For every query step of the three replayed tests: the lines it executes, recorded in a
+  fresh process per step so that cache-filling code counts for every step that needs it
+  (`tools/trace_units.py`, `maps/replay.json`), the lines those tests execute outside their
+  queries, and the TPC fixtures the steps read (`maps/tpc/`, copied from sqlglot).
 - The pinned sources, and the pinned import-time fingerprint.
+
+The image build unpacks the pinned sources and computes, with the image's own Python, the
+pinned import-time fingerprint and the pinned outcome of every replay step.
 
 Everything in `maps/` is derived from the pinned commit alone. There is no table from a patch,
 or from a kind of edit, to tests.
@@ -91,6 +109,11 @@ runs the tests it left out among those that ever touched the mutated file, and r
 that fail. Mode `cmp` makes only same-family comparison swaps, to test the comparison
 profile. It needs a scratch copy of the sqlglot checkout and the packages of
 `requirements.lock`.
+
+`tools/replay_check.py` does the same for the replay: for random mutants that select a
+replayed test it compares the replay's verdict with a full, separately written
+recomputation (`tools/replay_truth.py`) and reports any test dropped although its
+computation changed.
 
 ## Rebuilding the maps
 
@@ -116,3 +139,6 @@ then includes it in every commit that changes anything.
 - Import-time side effects that leave no trace in module or class state are not seen.
 - A patch that changes both import-time and call-time code in one file is compared as a whole,
   which can select more than needed, never less.
+- The replay stands for a test only as far as the test's own code is modelled in `replay.py`
+  (it was written from `tests/test_executor.py` at the pinned commit), and it assumes caches
+  inside sqlglot are plain memoisation.

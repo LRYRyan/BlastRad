@@ -238,9 +238,11 @@ def main():
     compare_dir = os.environ.get("BR_COMPARE_DIR")
     if compare_dir:
         compare_profile(compare_dir, index, out)
+    if os.environ.get("BR_UNITS") and os.environ.get("BR_ALWAYS_DIRS"):
+        replay_maps(os.environ["BR_UNITS"].split(os.pathsep), os.environ["BR_ALWAYS_DIRS"].split(os.pathsep), repo, out)
     with open(os.path.join(out, "meta.json"), "w") as handle:
         json.dump(meta, handle, separators=(",", ":"))
-    for name in ("meta.json", "rows.bin", "bitsets.bin", "src.bin", "fingerprint.bin", "compare.json"):
+    for name in ("meta.json", "rows.bin", "bitsets.bin", "src.bin", "fingerprint.bin", "compare.json", "replay.json"):
         if not os.path.exists(os.path.join(out, name)):
             continue
         os.chmod(os.path.join(out, name), 0o644)
@@ -252,6 +254,76 @@ def main():
         print("  %s: %d tests not traced, %d did not pass" % (trace_dir, missing, failed))
     for position in unmapped[:20]:
         print("  unmapped:", ids[position])
+
+
+def replay_maps(unit_files, always_dirs, repo, out):
+    """maps/replay.json: line coverage of every replay unit (see replay.py), what the replayed
+    tests execute outside their queries, and the fixtures the units need (maps/tpc/)."""
+    import shutil
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import replay
+
+    names = None
+    cover = {}
+    for path in unit_files:
+        with open(path, "rb") as handle:
+            data = pickle.load(handle)
+        keys = sorted(data["cover"])
+        if names is None:
+            names = keys
+        elif names != keys:
+            raise SystemExit("unit traces disagree on the units")
+        for key, lines in data["cover"].items():
+            cover.setdefault(key, set()).update(map(tuple, lines))
+    by_line = {}
+    for position, key in enumerate(names):
+        for name, line in cover[key]:
+            by_line.setdefault(name, {})
+            by_line[name][line] = by_line[name].get(line, 0) | (1 << position)
+    sets = {}
+    lines = {}
+    for name in sorted(by_line):
+        flat = []
+        for line in sorted(by_line[name]):
+            flat.append(line)
+            flat.append(sets.setdefault(by_line[name][line], len(sets)))
+        lines[name] = flat
+    tests = {}
+    for position, key in enumerate(names):
+        tests.setdefault(replay.test_of(key.split("/")[0]), []).append(position)
+    always = {}
+    for directory in always_dirs:
+        for path in sorted(glob.glob(os.path.join(directory, "*.pkl"))):
+            with open(path, "rb") as handle:
+                trace = pickle.load(handle)
+            shared = [entry for kind in ("run", "imp") for entry in trace["collection"][kind]]
+            for test, result in trace["tests"].items():
+                if result.get("outcome") != "passed":
+                    raise SystemExit("%s did not pass with its queries removed" % test)
+                found = always.setdefault(test, {})
+                for name, line in [entry for kind in ("run", "imp") for entry in result[kind]] + shared:
+                    found.setdefault(name, set()).add(line)
+    missing = sorted(set(tests) - set(always))
+    if missing:
+        raise SystemExit("no query-free trace for %s" % missing)
+    data = {
+        "units": names,
+        "tests": tests,
+        "sets": ["%x" % mask for mask, _ in sorted(sets.items(), key=lambda item: item[1])],
+        "lines": lines,
+        "always": {test: {name: sorted(found) for name, found in sorted(files.items())} for test, files in sorted(always.items())},
+    }
+    with open(os.path.join(out, "replay.json"), "w") as handle:
+        json.dump(data, handle, separators=(",", ":"))
+    for group, wanted in (("tpc-ds", (".csv.gz", "tpc-ds.sql")), ("tpc-h", ("tpc-h.sql",))):
+        source = os.path.join(repo, "tests", "fixtures", "optimizer", group)
+        target = os.path.join(out, "tpc", group)
+        os.makedirs(target, exist_ok=True)
+        for name in sorted(os.listdir(source)):
+            if name.endswith(wanted):
+                shutil.copyfile(os.path.join(source, name), os.path.join(target, name))
+    print("replay: %d coverage sets over %d files, %d distinct line sets" % (len(names), len(lines), len(sets)))
 
 
 def compare_profile(directory, index, out):
